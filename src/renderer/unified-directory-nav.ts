@@ -19,6 +19,7 @@ export type UnifiedDirectoryNavEntry =
       /** Row creation time (ISO-8601) for sidebar folder sorting (Serpent-db1835). */
       createdAt?: string;
       appearance?: EntityAppearance | null;
+      privacy?: { protected: boolean; locked: boolean };
     }
   | {
       kind: "linked";
@@ -33,6 +34,7 @@ export type UnifiedDirectoryNavEntry =
       /** Linked-root creation time; virtual children omit this. */
       createdAt?: string;
       appearance?: EntityAppearance | null;
+      privacy?: { protected: boolean; locked: boolean };
     };
 
 /**
@@ -62,6 +64,7 @@ export function buildUnifiedDirectoryNavEntries(
     directAssetCount: folder.directAssetCount,
     ...(folder.createdAt ? { createdAt: folder.createdAt } : {}),
     ...(folder.appearance ? { appearance: folder.appearance } : {}),
+    ...(folder.privacy ? { privacy: folder.privacy } : {}),
   }));
   const managedDepthById = new Map(
     managedEntries.map((entry) => [entry.folderId, entry.depth]),
@@ -129,6 +132,7 @@ export function buildUnifiedDirectoryNavEntries(
       ...(relativePath === "" && folder.appearance
         ? { appearance: folder.appearance }
         : {}),
+      ...(folder.privacy ? { privacy: folder.privacy } : {}),
     });
   }
 
@@ -144,6 +148,23 @@ export function managedFolderIdsWithChildren(
     if (entry.parentFolderId) parents.add(entry.parentFolderId);
   }
   return parents;
+}
+
+/** Hide descendants of locked roots, even if stale summaries contain them. */
+export function hideLockedDirectoryDescendants(entries: readonly UnifiedDirectoryNavEntry[]): UnifiedDirectoryNavEntry[] {
+  const locked = new Set(entries.filter((entry) => entry.privacy?.locked).map((entry) => entry.folderId));
+  const hidden = new Set<string>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const entry of entries) {
+      if (entry.parentFolderId && (locked.has(entry.parentFolderId) || hidden.has(entry.parentFolderId)) && !hidden.has(entry.folderId)) {
+        hidden.add(entry.folderId);
+        grew = true;
+      }
+    }
+  }
+  return entries.filter((entry) => !hidden.has(entry.folderId));
 }
 
 /**

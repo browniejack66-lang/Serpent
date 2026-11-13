@@ -36,8 +36,19 @@ function isPng(buffer: Buffer): boolean {
 export async function renderDocumentThumbnail(
   request: DocumentThumbnailRenderRequest,
   logger: AppLogger,
+  signal?: AbortSignal,
 ): Promise<DocumentThumbnailRenderResponse['result']> {
+  const aborted = (): DocumentThumbnailRenderResponse['result'] => ({
+    status: 'failed',
+    errorCode: 'DOCUMENT_RENDER_ABORTED',
+    reason: 'library media access changed',
+  });
+  if (signal?.aborted) return aborted();
   let window: BrowserWindow | null = null;
+  const cancel = () => {
+    if (window && !window.isDestroyed()) window.destroy();
+  };
+  signal?.addEventListener('abort', cancel, { once: true });
   try {
     window = new BrowserWindow({
       // `useContentSize` makes width/height the *page* viewport: without it the
@@ -73,6 +84,7 @@ export async function renderDocumentThumbnail(
         await new Promise((resolve) => requestAnimationFrame(() => resolve()));
       })()
     `, true);
+    if (signal?.aborted) return aborted();
     if (window.isDestroyed()) {
       return {
         status: 'failed',
@@ -81,6 +93,7 @@ export async function renderDocumentThumbnail(
       };
     }
     const image = await window.webContents.capturePage();
+    if (signal?.aborted) return aborted();
     if (image.isEmpty()) {
       return {
         status: 'failed',
@@ -103,6 +116,7 @@ export async function renderDocumentThumbnail(
       height: image.getSize().height,
     };
   } catch (error) {
+    if (signal?.aborted) return aborted();
     logger.error('document-thumbnail.render', error, {
       url: request.url,
     });
@@ -112,6 +126,7 @@ export async function renderDocumentThumbnail(
       reason: error instanceof Error ? error.message : 'document load failed',
     };
   } finally {
+    signal?.removeEventListener('abort', cancel);
     try {
       window?.destroy();
     } catch {

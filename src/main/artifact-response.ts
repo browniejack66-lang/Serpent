@@ -129,7 +129,8 @@ export async function createArtifactResponse(
       const size = fileStat.size;
       const commonHeaders = {
         'Accept-Ranges': 'bytes',
-        'Cache-Control': 'public, max-age=31536000, immutable',
+        // Folder permissions can change without changing the media URL.
+        'Cache-Control': 'private, no-store',
         'Content-Type': mimeType,
       };
 

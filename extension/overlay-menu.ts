@@ -12,10 +12,14 @@ interface ConnectionStatusResponse {
 interface FolderListResponse {
   kind: 'ok';
   folders: ExtensionFolderOption[];
+  // Serpent #91 / PR 92: opaque desktop privacy revision. Never null on 'ok'.
+  privacyRevision?: string | null;
 }
 
+// 'privacy-unconfirmed' means the desktop could not confirm the privacy state.
+// Consumers MUST fail closed instead of leaving a root-only save target.
 interface FolderListErrorResponse {
-  kind: 'rejected' | 'unreachable';
+  kind: 'rejected' | 'unreachable' | 'privacy-unconfirmed';
 }
 
 interface SaveResponse {
@@ -157,16 +161,36 @@ async function requestSave(
   });
 }
 
+// Serpent #91 / PR 92: the currently open overlay menu, so a privacy revision
+// change can revoke it from the content script (no tabs.query permission).
+let activeDispose: (() => void) | null = null;
+let overlayGeneration = 0;
+
+/** Close the open overlay menu and invalidate any in-flight folder fetch. */
+export function closeOverlaySaveMenu(): void {
+  overlayGeneration += 1;
+  const dispose = activeDispose;
+  activeDispose = null;
+  dispose?.();
+}
+
 export async function showOverlaySaveMenu(
   clientX: number,
   clientY: number,
   media: MediaTarget,
 ): Promise<void> {
+  closeOverlaySaveMenu();
   const { list, dispose } = createMenuShell(
     clientX,
     clientY,
     '保存到 Serpent',
   );
+  const generation = overlayGeneration;
+  const closeThisMenu = () => {
+    if (activeDispose === closeThisMenu) activeDispose = null;
+    dispose();
+  };
+  activeDispose = closeThisMenu;
 
   let connected: boolean;
   try {
@@ -177,6 +201,7 @@ export async function showOverlaySaveMenu(
   } catch {
     connected = false;
   }
+  if (generation !== overlayGeneration) return;
 
   const shell = list.parentElement;
   if (shell instanceof HTMLDivElement) {
@@ -196,7 +221,7 @@ export async function showOverlaySaveMenu(
     try {
       await action();
     } finally {
-      dispose();
+      closeThisMenu();
     }
   };
 
@@ -210,6 +235,7 @@ export async function showOverlaySaveMenu(
     const foldersResponse = await sendRuntimeMessage<
       FolderListResponse | FolderListErrorResponse
     >({ type: 'serpent-list-folders' });
+    if (generation !== overlayGeneration) return;
 
     if (foldersResponse.kind === 'ok') {
       for (const folder of foldersResponse.folders) {
@@ -219,8 +245,15 @@ export async function showOverlaySaveMenu(
           });
         });
       }
+      return;
     }
+
+    // 'privacy-unconfirmed', 'rejected', 'unreachable' and transport failures
+    // all leave the privacy state unconfirmed: fail closed and offer no target.
+    list.replaceChildren();
+    appendMenuItem(list, '无法确认目录状态，请稍后重试', null);
   } catch {
-    // Root folder remains available even when folder list fails.
+    list.replaceChildren();
+    appendMenuItem(list, '无法确认目录状态，请稍后重试', null);
   }
 }

@@ -9,9 +9,10 @@
 
 const blockedLibraryIds = new Set<string>();
 const abortByLibraryId = new Map<string, AbortController>();
+const fenceCountByLibraryId = new Map<string, number>();
 
 export function isLibraryMediaReadBlocked(libraryId: string): boolean {
-  return blockedLibraryIds.has(libraryId);
+  return blockedLibraryIds.has(libraryId) || (fenceCountByLibraryId.get(libraryId) ?? 0) > 0;
 }
 
 export function blockLibraryMediaReads(libraryId: string): void {
@@ -33,18 +34,22 @@ export function unblockLibraryMediaReads(libraryId: string): void {
  * user re-imports that library.
  */
 export function beginLibraryDeleteMediaFence(libraryId: string): void {
-  blockLibraryMediaReads(libraryId);
+  fenceCountByLibraryId.set(libraryId, (fenceCountByLibraryId.get(libraryId) ?? 0) + 1);
+  abortByLibraryId.get(libraryId)?.abort();
+  abortByLibraryId.delete(libraryId);
 }
 
 export function endLibraryDeleteMediaFence(libraryId: string): void {
-  unblockLibraryMediaReads(libraryId);
+  const count = fenceCountByLibraryId.get(libraryId) ?? 0;
+  if (count <= 1) fenceCountByLibraryId.delete(libraryId);
+  else fenceCountByLibraryId.set(libraryId, count - 1);
 }
 
 export function bindLibraryMediaReadSignal(
   libraryId: string,
   requestSignal?: AbortSignal | null,
 ): AbortSignal {
-  if (blockedLibraryIds.has(libraryId)) {
+  if (isLibraryMediaReadBlocked(libraryId)) {
     const alreadyAborted = new AbortController();
     alreadyAborted.abort();
     return requestSignal

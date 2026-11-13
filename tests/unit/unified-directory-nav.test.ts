@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildUnifiedDirectoryNavEntries,
   hideOfflineLinkedDirectoryEntries,
+  hideLockedDirectoryDescendants,
   filterCollapsedDirectoryEntries,
   folderIdsInSubtree,
   managedFolderIdsWithChildren,
@@ -774,6 +775,27 @@ describe("folderIdsInSubtree", () => {
       "a-1-1",
       "b",
     ]);
+  });
+});
+
+describe("hideLockedDirectoryDescendants", () => {
+  it("keeps only the outer locked root even when descendants are also protected", () => {
+    const entries = buildUnifiedDirectoryNavEntries([
+      managed({ folderId: "grandchild", parentFolderId: "child", name: "Grandchild", relativePath: "root/child/grandchild" }),
+      managed({ folderId: "child", parentFolderId: "root", name: "Nested lock", relativePath: "root/child", privacy: { protected: true, locked: true } }),
+      managed({ folderId: "root", name: "Locked", relativePath: "root", privacy: { protected: true, locked: true } }),
+      managed({ folderId: "public", name: "Public", relativePath: "public" }),
+    ], []);
+    expect(hideLockedDirectoryDescendants(entries).map((entry) => entry.folderId)).toEqual(["root", "public"]);
+  });
+
+  it("retains an independently locked linked child when its parent is unlocked", () => {
+    const entries = buildUnifiedDirectoryNavEntries([], [
+      linked({ folderId: "linked", displayName: "Linked", privacy: { protected: true, locked: false } }),
+      linked({ folderId: "lfv:linked/child", linkedFolderId: "linked", displayName: "Child", relativePath: "child", parentFolderId: "linked", privacy: { protected: true, locked: true } }),
+      linked({ folderId: "lfv:linked/child/deep", linkedFolderId: "linked", displayName: "Deep", relativePath: "child/deep", parentFolderId: "lfv:linked/child" }),
+    ]);
+    expect(hideLockedDirectoryDescendants(entries).map((entry) => entry.folderId)).toEqual(["linked", "lfv:linked/child"]);
   });
 });
 

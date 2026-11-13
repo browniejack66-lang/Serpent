@@ -12,7 +12,19 @@ import {
   type SaveMenuTreeFolder,
 } from './folder-menu';
 import { saveMenuTitle } from './connection-ui';
+import {
+  PRIVACY_REVISION_STORAGE_KEY,
+  PRIVACY_UNCONFIRMED_KIND,
+  classifyPrivacyRevision,
+  normalizePrivacyRevision,
+  pruneRecentFolderIdsForPrivacy,
+  validateExtensionSaveTargetForPrivacy,
+  visibleExtensionFolderIds,
+  type ExtensionFolderPrivacySnapshot,
+  type PrivacyRevisionChange,
+} from './folder-privacy';
 import { installHotlinkRules } from './hotlink-sites';
+import { startPrivacyWatcher, type PrivacyWatcher } from './privacy-events';
 import { isFileUrl } from './media-target';
 import { readExtensionSaveBehavior } from './preferences';
 import {
@@ -37,6 +49,12 @@ let notificationSequence = 0;
 let connectionState: 'connected' | 'disconnected' = 'disconnected';
 let dynamicFolderMenuIds: string[] = [];
 let folderMenuRefreshPromise: Promise<void> | null = null;
+/**
+ * Serpent #91 / PR 92: single long-poll watcher against GET /privacy-events.
+ * Lets a relock/protect invalidate cached menus + recents immediately instead
+ * of waiting for the 30s connection alarm. Only one runs at a time.
+ */
+let privacyWatcher: PrivacyWatcher | null = null;
 
 function readRecentFolderIds(): Promise<string[]> {
   return new Promise((resolve) => {
@@ -55,6 +73,136 @@ function writeRecentFolderIds(recentFolderIds: string[]): Promise<void> {
       resolve();
     });
   });
+}
+
+function readPrivacyRevision(): Promise<string | null> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(PRIVACY_REVISION_STORAGE_KEY, (values) => {
+      void chrome.runtime.lastError;
+      resolve(normalizePrivacyRevision(values[PRIVACY_REVISION_STORAGE_KEY]));
+    });
+  });
+}
+
+function writePrivacyRevision(revision: string | null): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [PRIVACY_REVISION_STORAGE_KEY]: revision }, () => {
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+}
+
+/**
+ * Serpent #91 / PR 92: persist only a real revision change (or an unconfirmed
+ * state). Writing this chrome.storage.local key fires storage.onChanged in
+ * every content script, which closes already-open save menus. Cached recent
+ * ids are intersected with the authoritative visible list so a hidden root,
+ * its descendants or a deleted folder cannot survive a re-lock.
+ */
+async function observePrivacyRevision(
+  incoming: string | null,
+  visibleFolderIds: ReadonlySet<string>,
+): Promise<PrivacyRevisionChange> {
+  const cached = await readPrivacyRevision();
+  const change = classifyPrivacyRevision(cached, incoming);
+  // Always clean cached recents, even when the revision is unchanged: a
+  // deleted folder or a newly protected descendant must not stay in storage.
+  const storedRecents = await readRecentFolderIds();
+  const pruned = pruneRecentFolderIdsForPrivacy(storedRecents, visibleFolderIds);
+  if (
+    pruned.length !== storedRecents.length ||
+    pruned.some((id, index) => id !== storedRecents[index])
+  ) {
+    await writeRecentFolderIds(pruned);
+  }
+  if (change === 'unchanged') return change;
+  await writePrivacyRevision(normalizePrivacyRevision(incoming));
+  return change;
+}
+
+/**
+ * Serpent #91 / PR 92: clear cached recents + privacy revision, broadcast to
+ * content scripts (which close any open save menu), then rebuild menus from a
+ * fresh /folders. Called the moment the desktop reports a privacy generation
+ * change — a relock or protect must revoke a stale open menu immediately.
+ */
+async function invalidatePrivacyCachesAndRebuild(): Promise<void> {
+  // Clear the revision (so the next observe always sees a change) and prune
+  // every cached recent id; observePrivacyRevision with an empty visible set
+  // wipes them and writes the unconfirmed revision, which broadcasts.
+  await observePrivacyRevision(null, new Set<string>());
+  await refreshFolderMenus();
+}
+
+/** Start the single privacy watcher if not already running. */
+function ensurePrivacyWatcher(): void {
+  if (privacyWatcher) return;
+  privacyWatcher = startPrivacyWatcher({
+    onPrivacyChanged: () => {
+      void invalidatePrivacyCachesAndRebuild();
+    },
+    onDisconnected: () => {
+      // Keep the watcher alive so it reconnects with backoff; nothing to clear
+      // on disconnect because the desktop is gone and menus are pruned on the
+      // next successful refresh.
+    },
+    onReconnected: () => {
+      // Restore menus promptly after the desktop comes back.
+      void refreshConnectionState();
+    },
+  });
+}
+
+/** Stop the watcher (e.g. the desktop went away) and clear the handle. */
+function stopPrivacyWatcher(): void {
+  if (!privacyWatcher) return;
+  privacyWatcher.stop();
+  privacyWatcher = null;
+}
+
+/** Defence in depth: the desktop already filtered, but never trust a flag. */
+function visibleFoldersOnly(folders: readonly ExtensionFolderOption[]): ExtensionFolderOption[] {
+  const visible = visibleExtensionFolderIds(folders);
+  return folders.filter((folder) => visible.has(folder.folderId));
+}
+
+/** Reject a save when a FRESH /folders cannot confirm the target is visible. */
+async function privacySaveRejection(
+  targetFolderId: string | null | undefined,
+): Promise<UserNotification | null> {
+  let snapshot: ExtensionFolderPrivacySnapshot | null = null;
+  try {
+    const outcome = await fetchSerpentFolders();
+    if (outcome.kind === 'ok') {
+      snapshot = { privacyRevision: outcome.privacyRevision, folders: outcome.folders };
+    }
+  } catch {
+    snapshot = null;
+  }
+  if (!snapshot) {
+    return {
+      title: '请重新选择可用目录',
+      message: '无法确认 Serpent 的目录隐私状态，请稍后重试或重新选择可用目录。',
+    };
+  }
+  const revision = normalizePrivacyRevision(snapshot.privacyRevision);
+  if (revision === null) {
+    await observePrivacyRevision(null, new Set<string>());
+    return {
+      title: '请重新选择可用目录',
+      message: '暂时无法确认 Serpent 的目录隐私状态，请重新选择可用目录后再保存。',
+    };
+  }
+  await observePrivacyRevision(revision, visibleExtensionFolderIds(snapshot.folders));
+  const verdict = validateExtensionSaveTargetForPrivacy(targetFolderId, snapshot);
+  if (verdict.ok) return null;
+  return {
+    title: '请重新选择可用目录',
+    message: verdict.reason === 'privacy-unconfirmed'
+      ? '暂时无法确认 Serpent 的目录隐私状态，请重新选择可用目录后再保存。'
+      : '目标目录已受保护或已失效，请重新选择可用目录，不会静默改存到其他位置。',
+  };
 }
 
 function createMenuItem(properties: {
@@ -201,11 +349,26 @@ async function refreshFolderMenus(): Promise<void> {
 
     await removeDynamicFolderMenus();
 
-    const recentFolderIds = await readRecentFolderIds();
+    // Serpent #91 / PR 92: null revision = privacy state unconfirmed (or an
+    // old desktop build). Fail closed: no folder entries, no cached recents.
+    const privacyRevision = normalizePrivacyRevision(outcome.privacyRevision);
+    if (privacyRevision === null) {
+      await observePrivacyRevision(null, new Set<string>());
+      return;
+    }
+
+    const folders = visibleFoldersOnly(outcome.folders);
+    const visibleFolderIds = visibleExtensionFolderIds(folders);
+    await observePrivacyRevision(privacyRevision, visibleFolderIds);
+
+    const recentFolderIds = pruneRecentFolderIdsForPrivacy(
+      await readRecentFolderIds(),
+      visibleFolderIds,
+    );
     const hints = buildSaveMenuFolderHints(
-      outcome.folders,
+      folders,
       recentFolderIds,
-      outcome.recentBrowsedFolderIds,
+      outcome.recentBrowsedFolderIds.filter((id) => visibleFolderIds.has(id)),
     );
 
     // 与拖拽树一致：最近保存/浏览 → 分割线 → 根目录 → 所有一级目录（子级递归展开）。
@@ -232,7 +395,7 @@ async function refreshFolderMenus(): Promise<void> {
     };
 
     let separatorCreated = false;
-    for (const item of buildSaveMenuTree(outcome.folders, hints)) {
+    for (const item of buildSaveMenuTree(folders, hints)) {
       if (item.kind === 'separator') {
         if (separatorCreated) continue;
         separatorCreated = true;
@@ -265,6 +428,11 @@ async function refreshConnectionState(): Promise<void> {
   const nextState = outcome.kind === 'connected' ? 'connected' : 'disconnected';
   connectionState = nextState;
   setToolbarIcon(nextState === 'connected');
+  if (nextState === 'connected') {
+    ensurePrivacyWatcher();
+  } else {
+    stopPrivacyWatcher();
+  }
   await refreshFolderMenus();
 }
 
@@ -280,6 +448,11 @@ async function probeAndReplyConnectionState(): Promise<'connected' | 'disconnect
   const nextState = outcome.kind === 'connected' ? 'connected' : 'disconnected';
   connectionState = nextState;
   setToolbarIcon(nextState === 'connected');
+  if (nextState === 'connected') {
+    ensurePrivacyWatcher();
+  } else {
+    stopPrivacyWatcher();
+  }
   void refreshFolderMenus();
   return nextState;
 }
@@ -327,6 +500,14 @@ async function rememberRecentFolder(
 }
 
 async function saveIntentAndNotify(intent: SaveIntent): Promise<UserNotification> {
+  // A FRESH /folders snapshot is required before EVERY save: a target that
+  // became protected between opening the menu and saving must be rejected,
+  // never silently redirected to the library root.
+  const rejection = await privacySaveRejection(intent.targetFolderId);
+  if (rejection) {
+    showNotification(rejection);
+    return rejection;
+  }
   const behavior = await readExtensionSaveBehavior();
   const outcome = await saveMediaViaBrowser(intent, behavior);
   if (outcome.kind === 'accepted') {
@@ -334,7 +515,7 @@ async function saveIntentAndNotify(intent: SaveIntent): Promise<UserNotification
     if (foldersOutcome.kind === 'ok') {
       const folderId =
         typeof intent.targetFolderId === 'string' ? intent.targetFolderId : null;
-      await rememberRecentFolder(folderId, foldersOutcome.folders);
+      await rememberRecentFolder(folderId, visibleFoldersOnly(foldersOutcome.folders));
       await refreshFolderMenus();
     }
   }
@@ -379,6 +560,12 @@ async function saveLocalUploadAndNotify(input: {
     return notification;
   }
 
+  const rejection = await privacySaveRejection(input.targetFolderId);
+  if (rejection) {
+    showNotification(rejection);
+    return rejection;
+  }
+
   const behavior = await readExtensionSaveBehavior();
   const outcome = await deliverSaveUpload(
     {
@@ -398,7 +585,7 @@ async function saveLocalUploadAndNotify(input: {
     if (foldersOutcome.kind === 'ok') {
       await rememberRecentFolder(
         typeof input.targetFolderId === 'string' ? input.targetFolderId : null,
-        foldersOutcome.folders,
+        visibleFoldersOnly(foldersOutcome.folders),
       );
       await refreshFolderMenus();
     }
@@ -526,18 +713,31 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     void (async () => {
       const outcome = await fetchSerpentFolders();
       if (outcome.kind === 'ok') {
-        const recentFolderIds = await readRecentFolderIds();
+        const revision = normalizePrivacyRevision(outcome.privacyRevision);
+        if (revision === null) {
+          await observePrivacyRevision(null, new Set<string>());
+          sendResponse({ kind: PRIVACY_UNCONFIRMED_KIND });
+          return;
+        }
+        const folders = visibleFoldersOnly(outcome.folders);
+        const visibleFolderIds = visibleExtensionFolderIds(folders);
+        await observePrivacyRevision(revision, visibleFolderIds);
+        const recentFolderIds = pruneRecentFolderIdsForPrivacy(
+          await readRecentFolderIds(),
+          visibleFolderIds,
+        );
         const hints = buildSaveMenuFolderHints(
-          outcome.folders,
+          folders,
           recentFolderIds,
-          outcome.recentBrowsedFolderIds,
+          outcome.recentBrowsedFolderIds.filter((id) => visibleFolderIds.has(id)),
         );
         sendResponse({
           kind: 'ok',
-          folders: sortFoldersForSaveMenu(outcome.folders, hints),
+          folders: sortFoldersForSaveMenu(folders, hints),
           recentFolderIds: hints.savedRecentIds,
           recentBrowsedFolderIds: hints.browsedRecentIds,
           libraryDisplayName: outcome.libraryDisplayName,
+          privacyRevision: revision,
         });
         return;
       }

@@ -11,6 +11,7 @@ import {
   type AiProgressEvent,
 } from '../shared/protocol/responses';
 import { stopOutgoingLibrariesForOpen } from './library-open-stop';
+import { collectPrivacyGuardedAssetIds } from './folder-privacy-fence';
 import type { ParentPort } from 'electron';
 import {
   BUNDLED_HDRI_PRESET_IDS,
@@ -2302,7 +2303,23 @@ function destructiveBackupLibraryId(command: WorkerCommand): string | undefined 
   }
 }
 
+/**
+ * Deny any command that names an asset inside a currently locked privacy root.
+ * Called before dispatch AND again after the awaits in handleRequest so a
+ * `folder.privacy` lock that lands mid-request cannot be raced (TOCTOU).
+ * The id extractor lives in its own module so it can be unit-tested without
+ * importing the side-effecting Worker entry point.
+ */
+function assertPrivacyFence(request: WorkerRequest): void {
+  const libraryId = 'libraryId' in request.command ? request.command.libraryId : undefined;
+  if (typeof libraryId !== 'string') return;
+  const ids = collectPrivacyGuardedAssetIds(request.command);
+  if (ids.length === 0) return;
+  libraryService.assertRequestAssetsNotPrivacyLocked(libraryId, ids);
+}
+
 async function handleRequest(request: WorkerRequest): Promise<WorkerResult> {
+  assertPrivacyFence(request);
   if (request.command.type === 'library.open' || request.command.type === 'library.close'
     || request.command.type === 'library.delete-from-disk') {
     await closeSemanticIndexWorkerLibrary(request.command.type === 'library.open' ? undefined : request.command.libraryId);
@@ -2368,6 +2385,7 @@ async function handleRequest(request: WorkerRequest): Promise<WorkerResult> {
   if (request.command.type === 'selection.trash') {
     const lease = await libraryService.acquireWriteLease(request.command.libraryId);
     try {
+      assertPrivacyFence(request);
       const result = await libraryService.trashSelectionAsync({
         libraryId: request.command.libraryId,
         assetIds: request.command.assetIds,
@@ -2392,6 +2410,9 @@ async function handleRequest(request: WorkerRequest): Promise<WorkerResult> {
     return handleRequestWithoutWriteLease(request);
   }
 
+  // Re-check after the awaits above: a folder.privacy lock may have landed
+  // while this request was in flight.
+  assertPrivacyFence(request);
   try {
     const result = await libraryService.runBoundedWrite(
       libraryId,
@@ -2485,6 +2506,7 @@ function stopAutomaticWorkForLibrary(
 }
 
 async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<WorkerResult> {
+  assertPrivacyFence(request);
   switch (request.command.type) {
     case 'library.list':
     case 'library.change-sequence':
@@ -2582,6 +2604,18 @@ async function handleRequestWithoutWriteLease(request: WorkerRequest): Promise<W
         absolutePath: resolved.absolutePath,
         mimeType: resolved.mimeType,
       };
+    }
+    case 'folder.privacy': {
+      const result = await executeFolderWorkerCommand(libraryService, request, {
+        scheduleCoverThumbnails: (libraryId, assetIds, maxIds) => {
+          scheduleThumbnailScene(libraryId, 'cover', assetIds, maxIds);
+        },
+        recordPermanentDeleteBarrier,
+      });
+      if (result === undefined) {
+        throw new Error(`Unhandled folder command: ${request.command.type}`);
+      }
+      return result;
     }
     case 'folder.rename':
     case 'folder.clone':

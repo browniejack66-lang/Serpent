@@ -28,4 +28,24 @@ describe('extension-recent-browse-folders', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('drops hidden / protected scopes at the storage boundary (Serpent #91)', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'serpent-ext-browse-'));
+    const filePath = path.join(dir, 'browse.json');
+    try {
+      recordExtensionBrowseFolder(filePath, 'lib-a', 'vault');
+      recordExtensionBrowseFolder(filePath, 'lib-a', 'vault-child');
+      recordExtensionBrowseFolder(filePath, 'lib-a', 'keep');
+      const hidden = new Set(['vault', 'vault-child']);
+      expect(readExtensionBrowseFolderIds(filePath, 'lib-a', hidden)).toEqual(['keep']);
+      // An empty hidden set preserves existing behaviour.
+      expect(readExtensionBrowseFolderIds(filePath, 'lib-a', new Set<string>())).toEqual([
+        'keep',
+        'vault-child',
+        'vault',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

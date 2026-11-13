@@ -8,6 +8,7 @@ export const ASSET_NATIVE_DRAG_READINESS_CHANNEL = 'serpent:asset:native-drag-re
 export const LIBRARY_LIFECYCLE_CHANNEL = 'serpent:library:lifecycle' as const;
 export const ASSET_CHANGE_CHANNEL = 'serpent:asset:changed' as const;
 export const LIBRARY_CHANGED_CHANNEL = 'serpent:library:changed' as const;
+export const FOLDER_PRIVACY_CHANGED_CHANNEL = 'serpent:folder:privacy-changed' as const;
 export const THUMBNAIL_CHANNEL = 'serpent:thumbnail' as const;
 export const PROGRESS_CHANNEL = 'serpent:progress' as const;
 export const AI_PROGRESS_CHANNEL = 'serpent:ai:progress' as const;

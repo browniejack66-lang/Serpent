@@ -56,7 +56,13 @@ export const portableRelativePathSchema = nonBlankString.superRefine((value, con
   }
 });
 
+const folderPrivacySummarySchema = z.strictObject({
+  protected: z.boolean(),
+  locked: z.boolean(),
+});
+
 export const managedFolderSummarySchema = z.strictObject({
+  privacy: folderPrivacySummarySchema.optional(),
   folderId: nonBlankString,
   parentFolderId: nonBlankString.nullable(),
   name: nonBlankString,
@@ -81,6 +87,7 @@ export type ManagedFolderSummary = z.infer<typeof managedFolderSummarySchema>;
  * Covers and counts are batched by the Worker — Renderer never N+1 queries.
  */
 export const folderBrowseEntrySchema = z.strictObject({
+  privacy: folderPrivacySummarySchema.optional(),
   folderId: nonBlankString,
   parentFolderId: nonBlankString.nullable(),
   locationKind: z.enum(['managed', 'linked']),
@@ -144,6 +151,7 @@ export const trashedFolderSummarySchema = z.strictObject({
 export type TrashedFolderSummary = z.infer<typeof trashedFolderSummarySchema>;
 
 export const linkedFolderSummarySchema = z.strictObject({
+  privacy: folderPrivacySummarySchema.optional(),
   folderId: nonBlankString,
   displayName: nonBlankString,
   status: z.enum(['available', 'offline']),

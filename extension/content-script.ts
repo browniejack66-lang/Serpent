@@ -1,4 +1,6 @@
+import { PRIVACY_REVISION_STORAGE_KEY } from './folder-privacy';
 import { isFileUrl, mediaFromElement, resolveMediaTargetFromDragEvent } from './media-target';
+import { closeOverlaySaveMenu } from './overlay-menu';
 import {
   DRAG_RADIAL_MENU_ENABLED_KEY,
   dragRadialMenuEnabledFromStored,
@@ -6,6 +8,7 @@ import {
 } from './preferences';
 import {
   applyDragGhostThumbnail,
+  closeRadialSaveMenu,
   encodeLocalImage,
   startRadialSaveMenu,
 } from './radial-menu';
@@ -79,10 +82,20 @@ void readDragRadialMenuEnabled().then((enabled) => {
   radialMenuEnabled = enabled;
 });
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== 'sync') return;
-  const change = changes[DRAG_RADIAL_MENU_ENABLED_KEY];
-  if (change) {
-    radialMenuEnabled = dragRadialMenuEnabledFromStored(change.newValue);
+  if (areaName === 'sync') {
+    const change = changes[DRAG_RADIAL_MENU_ENABLED_KEY];
+    if (change) {
+      radialMenuEnabled = dragRadialMenuEnabledFromStored(change.newValue);
+    }
+    return;
+  }
+  // Serpent #91 / PR 92: a relock or protection change invalidates the cached
+  // folder list. Revoke any already-open save menu so it cannot offer a stale
+  // (possibly protected) target. The extension has no tabs.query permission,
+  // so the key itself is the broadcast channel.
+  if (areaName === 'local' && changes[PRIVACY_REVISION_STORAGE_KEY]) {
+    closeRadialSaveMenu();
+    closeOverlaySaveMenu();
   }
 });
 

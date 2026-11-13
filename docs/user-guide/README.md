@@ -8,6 +8,7 @@
 - [WebDAV 云同步](sync.md)——服务器配置、资源库绑定、自动同步与打开远端同步库
 - [AI 分析](ai.md)——支持的资产、自动/手动分析、任务进度和隐私提示
 - [浏览器扩展](browser-extension.md)——Chrome / Edge / Firefox 保存网页图片视频
+- [文件夹隐私锁](folder-privacy-lock.md)——给文件夹加密码锁，锁定后在应用与扩展中隐藏内容
 - [插件使用](plugins.md)——安装、启用、更新和卸载插件
 - [自动化功能](automation.md)——自动化脚本和 MCP 外部客户端连接
 - [故障排查](troubleshooting.md)——常见问题与解决

@@ -25,6 +25,22 @@ export async function executeFolderWorkerCommand(
   hooks: FolderCommandHooks,
 ): Promise<WorkerResult | undefined> {
   switch (request.command.type) {
+    case 'folder.privacy': {
+      const command = request.command;
+      const result = libraryService.folderPrivacy({
+        libraryId: command.libraryId,
+        folderId: command.folderId,
+        action: command.action,
+        password: command.password,
+        newPassword: command.newPassword,
+      });
+      return {
+        ok: true,
+        type: 'folder.privacy',
+        libraryId: command.libraryId,
+        states: result.states,
+      };
+    }
     case 'folder.rename': {
       const command = request.command;
       const before = libraryService.getManagedFolderHistorySnapshot({

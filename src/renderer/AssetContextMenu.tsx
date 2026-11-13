@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { SerpentLibraryApi } from "../shared/library-api";
 import type {
   SmartCollectionSummary,
@@ -38,6 +38,7 @@ import {
 } from "../shared/embedding/modalities";
 import type { EmbeddingHttpAdapter } from "../shared/embedding/http-service";
 import { Icon, type IconName } from "./Icons";
+import { DialogShell } from "./ui/patterns";
 import { formatRuntimeShortcut } from "./shortcut-runtime";
 import { TagPickerEntry, TagPickerMenu } from "./TagPickerMenu";
 import { CollectionPickerMenu } from "./CollectionPickerMenu";
@@ -466,6 +467,55 @@ interface AssetContextMenuProps {
 
 export function AssetContextMenu(props: AssetContextMenuProps) {
   const { locale, t } = useLocale();
+  const [privacyOpen, setPrivacyOpen] = useState(false);
+  const [privacyAction, setPrivacyAction] = useState<"protect" | "unlock" | "lock" | "remove" | "change-password">("protect");
+  const [privacyPassword, setPrivacyPassword] = useState("");
+  const [privacyNewPassword, setPrivacyNewPassword] = useState("");
+  const [privacyError, setPrivacyError] = useState("");
+  const [privacyBusy, setPrivacyBusy] = useState(false);
+  const [privacyTarget, setPrivacyTarget] = useState<{ folderId: string; name: string; locationKind: "managed" | "linked" } | null>(null);
+  const [privacyProtected, setPrivacyProtected] = useState(false);
+  const [privacyLocked, setPrivacyLocked] = useState(false);
+  const [privacyConfirm, setPrivacyConfirm] = useState("");
+  const privacyRequestId = useRef(0);
+  const privacyMutationInFlight = useRef(false);
+  const [privacyLibraryId, setPrivacyLibraryId] = useState(props.libraryId);
+  if (privacyLibraryId !== props.libraryId) {
+    setPrivacyLibraryId(props.libraryId);
+    setPrivacyOpen(false);
+    setPrivacyTarget(null);
+    setPrivacyPassword("");
+    setPrivacyNewPassword("");
+    setPrivacyConfirm("");
+    setPrivacyBusy(false);
+  }
+  useEffect(() => {
+    privacyRequestId.current += 1;
+    privacyMutationInFlight.current = false;
+  }, [props.libraryId]);
+  useEffect(() => {
+    const api = (window as RendererWindow).serpent?.library;
+    if (!api) return;
+    return api.onFolderPrivacyChanged((event) => {
+      if (event.libraryId !== props.libraryId || !privacyOpen || !privacyTarget || privacyMutationInFlight.current) return;
+      const requestId = ++privacyRequestId.current;
+      setPrivacyBusy(true);
+      void api.folderPrivacy({ libraryId: event.libraryId, folderId: privacyTarget.folderId, action: "status" }).then((result) => {
+        if (requestId !== privacyRequestId.current || !result.ok) return;
+        const state = result.value.find((item) => item.folderId === privacyTarget.folderId);
+        setPrivacyProtected(state !== undefined);
+        setPrivacyLocked(state?.locked ?? false);
+        setPrivacyAction(state ? (state.locked ? "unlock" : "lock") : "protect");
+        setPrivacyPassword("");
+        setPrivacyNewPassword("");
+        setPrivacyConfirm("");
+        setPrivacyError("");
+      }).catch(() => undefined).finally(() => {
+        if (requestId === privacyRequestId.current) setPrivacyBusy(false);
+      });
+    });
+  }, [props.libraryId, privacyOpen, privacyTarget]);
+  const { close: closeContextMenu } = useContextMenu();
   const {
     tags,
     collections,
@@ -711,20 +761,109 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
     });
   };
 
-  if (!activeContextMenu) return null;
+  const resetPrivacyDialog = () => {
+    privacyRequestId.current += 1;
+    privacyMutationInFlight.current = false;
+    setPrivacyOpen(false);
+    setPrivacyPassword("");
+    setPrivacyNewPassword("");
+    setPrivacyConfirm("");
+    setPrivacyError("");
+    setPrivacyBusy(false);
+  };
+
+  const openPrivacyDialog = async (descriptor: Extract<ContextMenuDescriptor, { type: "folder" }>) => {
+    const requestId = ++privacyRequestId.current;
+    const summary = descriptor.locationKind === "linked"
+      ? linkedFolders.find((folder) => folder.folderId === descriptor.folderId)?.privacy
+      : managedFolders.find((folder) => folder.folderId === descriptor.folderId)?.privacy;
+    setPrivacyTarget({ folderId: descriptor.folderId, name: descriptor.name, locationKind: descriptor.locationKind });
+    setPrivacyProtected(summary?.protected === true);
+    setPrivacyLocked(summary?.locked === true);
+    setPrivacyAction(summary?.protected ? (summary.locked ? "unlock" : "lock") : "protect");
+    setPrivacyPassword("");
+    setPrivacyNewPassword("");
+    setPrivacyConfirm("");
+    setPrivacyError("");
+    setPrivacyOpen(true);
+    setPrivacyBusy(true);
+    closeContextMenu();
+    try {
+      if (!props.libraryId) throw new Error(t("command.folder.privacyUnavailable"));
+      const status = await (window as RendererWindow).serpent?.library?.folderPrivacy({ libraryId: props.libraryId, folderId: descriptor.folderId, action: "status" });
+      if (!status) throw new Error(t("command.folder.privacyUnavailable"));
+      if (!status.ok) throw new Error(status.error.message);
+      if (requestId !== privacyRequestId.current) return;
+      const state = status.value.find((item) => item.folderId === descriptor.folderId);
+      setPrivacyProtected(state !== undefined);
+      setPrivacyLocked(state?.locked ?? false);
+      setPrivacyAction(state ? (state.locked ? "unlock" : "lock") : "protect");
+    } catch (error) {
+      if (requestId === privacyRequestId.current) {
+        setPrivacyError(error instanceof Error ? error.message : t("command.folder.privacyFailed"));
+      }
+    } finally {
+      if (requestId === privacyRequestId.current) setPrivacyBusy(false);
+    }
+  };
+
+  const submitPrivacyAction = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!props.libraryId || !privacyTarget) return;
+    if ((privacyAction === "protect" || privacyAction === "change-password") && privacyNewPassword !== privacyConfirm) {
+      setPrivacyError(t("command.folder.privacyPasswordMismatch"));
+      return;
+    }
+    if (privacyAction === "remove" && privacyConfirm !== privacyTarget.name) {
+      setPrivacyError(t("command.folder.privacyConfirmNameMismatch"));
+      return;
+    }
+    const requestId = ++privacyRequestId.current;
+    privacyMutationInFlight.current = true;
+    setPrivacyBusy(true);
+    setPrivacyError("");
+    try {
+      const api = (window as RendererWindow).serpent?.library;
+      if (!api) throw new Error(t("command.folder.privacyUnavailable"));
+      const result = await api.folderPrivacy({
+        libraryId: props.libraryId,
+        folderId: privacyTarget.folderId,
+        action: privacyAction,
+        ...(privacyAction === "protect" ? { password: privacyNewPassword } : {}),
+        ...(["unlock", "change-password", "remove"].includes(privacyAction) ? { password: privacyPassword } : {}),
+        ...(privacyAction === "change-password" ? { newPassword: privacyNewPassword } : {}),
+      });
+      if (!result.ok) throw new Error(result.error.message);
+      if (requestId === privacyRequestId.current) resetPrivacyDialog();
+    } catch (error) {
+      if (requestId === privacyRequestId.current) {
+        setPrivacyError(error instanceof Error ? error.message : t("command.folder.privacyFailed"));
+        setPrivacyPassword("");
+        setPrivacyNewPassword("");
+        setPrivacyConfirm("");
+      }
+    } finally {
+      if (requestId === privacyRequestId.current) {
+        privacyMutationInFlight.current = false;
+        setPrivacyBusy(false);
+      }
+    }
+  };
+
+  if (!activeContextMenu && !privacyOpen) return null;
   // Serpent-接管: the workspace canvas menu is a plugin extension point
   // (PLUGIN-015). With no plugin contributions it would render an empty
   // floating menu on blank-canvas right-click — suppress it entirely; the
   // active descriptor stays set so a late async contribution still appears.
   if (
-    activeContextMenu.descriptor.type === "workspace" &&
+    activeContextMenu?.descriptor.type === "workspace" &&
     pluginWorkspaceMenuItems.length === 0
   ) {
     return null;
   }
 
-  const ariaLabel =
-    activeContextMenu.descriptor.type === "multi-asset"
+  const ariaLabel = activeContextMenu
+    ? activeContextMenu.descriptor.type === "multi-asset"
       ? t("menu.batchAssetOps", {
           count: activeContextMenu.descriptor.assetIds.length,
         })
@@ -752,10 +891,12 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                   })
                 : t("menu.smartCollectionOps", {
                   name: activeContextMenu.descriptor.name,
-                });
+                })
+    : "";
 
   return (
-    <ContextMenuBackdrop>
+    <>
+    {activeContextMenu && <ContextMenuBackdrop>
       <ContextMenu
         ariaLabel={
           tagPicker
@@ -1283,6 +1424,7 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
                 />
               </ContextMenuSection>
               <ContextMenuSection label={t("command.group.folders")}>
+                <ContextMenuItem icon={<Icon name="vault" size={14} />} label={t("command.folder.privacy")} onAction={() => { void openPrivacyDialog(desc); }} />
                 <PluginMenuItems
                   items={folderPluginItems("organize", "before")}
                   onRun={(item) => runPluginCommand(item, { folderIds: [desc.folderId] })}
@@ -2596,6 +2738,26 @@ export function AssetContextMenu(props: AssetContextMenuProps) {
           </>
         )}
       </ContextMenu>
-    </ContextMenuBackdrop>
+    </ContextMenuBackdrop>}
+    {privacyOpen && privacyTarget && <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !privacyBusy) resetPrivacyDialog(); }}>
+      <DialogShell className="create-dialog" dialogId="folder-privacy" title={t("command.folder.privacyTitle", { name: privacyTarget.name })} onRequestClose={() => { if (!privacyBusy) resetPrivacyDialog(); }}>
+      <form onSubmit={(event) => void submitPrivacyAction(event)}>
+        <label className="field-label">{t("command.folder.privacyAction")}<select className="text-field" aria-label={t("command.folder.privacyAction")} autoFocus value={privacyAction} disabled={privacyBusy} onChange={(event) => { setPrivacyAction(event.target.value as typeof privacyAction); setPrivacyPassword(""); setPrivacyNewPassword(""); setPrivacyConfirm(""); setPrivacyError(""); }}>
+          {!privacyProtected && <option value="protect">{t("command.folder.privacyProtect")}</option>}
+          {privacyProtected && privacyLocked && <option value="unlock">{t("command.folder.privacyUnlock")}</option>}
+          {privacyProtected && !privacyLocked && <><option value="lock">{t("command.folder.privacyLock")}</option><option value="change-password">{t("command.folder.privacyChangePassword")}</option><option value="remove">{t("command.folder.privacyRemove")}</option></>}
+        </select></label>
+        {(privacyAction === "unlock" || privacyAction === "change-password") && <label className="field-label">{t("command.folder.privacyPassword")}<input className="text-field" autoComplete="current-password" maxLength={1024} type="password" value={privacyPassword} onChange={(event) => setPrivacyPassword(event.target.value)} required /></label>}
+        {(privacyAction === "protect" || privacyAction === "change-password") && <><label className="field-label">{t("command.folder.privacyNewPassword")}<input className="text-field" autoComplete="new-password" maxLength={1024} type="password" value={privacyNewPassword} onChange={(event) => setPrivacyNewPassword(event.target.value)} required /></label><label className="field-label">{t("command.folder.privacyConfirmPassword")}<input className="text-field" autoComplete="new-password" maxLength={1024} type="password" value={privacyConfirm} onChange={(event) => setPrivacyConfirm(event.target.value)} required /></label></>}
+        {privacyAction === "remove" && <><label className="field-label">{t("command.folder.privacyPassword")}<input className="text-field" autoComplete="current-password" maxLength={1024} type="password" value={privacyPassword} onChange={(event) => setPrivacyPassword(event.target.value)} required /></label><label className="field-label">{t("command.folder.privacyConfirmName", { name: privacyTarget.name })}<input className="text-field" autoComplete="off" value={privacyConfirm} onChange={(event) => setPrivacyConfirm(event.target.value)} required /></label></>}
+        {privacyError && <p className="inline-error" role="alert">{privacyError}</p>}
+        <div className="dialog-actions">
+          <button className="secondary-button" type="button" disabled={privacyBusy} onClick={resetPrivacyDialog}>{t("common.cancel")}</button>
+          <button className="primary-button" type="submit" disabled={privacyBusy || !props.libraryId}>{privacyBusy ? t("common.saving") : t("common.confirm")}</button>
+        </div>
+      </form>
+      </DialogShell>
+    </div>}
+    </>
   );
 }

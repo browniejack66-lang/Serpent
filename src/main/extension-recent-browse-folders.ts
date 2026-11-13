@@ -40,11 +40,22 @@ export function recordExtensionBrowseFolder(
   writeStore(filePath, store);
 }
 
+/**
+ * Read the persisted recent browse scopes for a library.
+ *
+ * `hiddenFolderIds` (Serpent #91 / PR 92) lets callers drop protected roots
+ * and their descendants at the storage boundary as well, so a stale store can
+ * never leak a protected folder id into the extension menu ranking. Optional
+ * so existing callers keep their behaviour.
+ */
 export function readExtensionBrowseFolderIds(
   filePath: string,
   libraryId: string,
+  hiddenFolderIds?: ReadonlySet<string>,
 ): string[] {
   if (!libraryId) return [];
   const store = readStore(filePath);
-  return store.byLibrary[libraryId] ?? [];
+  const ids = store.byLibrary[libraryId] ?? [];
+  if (!hiddenFolderIds || hiddenFolderIds.size === 0) return ids;
+  return ids.filter((folderId) => !hiddenFolderIds.has(folderId));
 }

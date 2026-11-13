@@ -7,6 +7,9 @@ import type { LibraryNavigationSummary } from './library-navigation';
 import type { MutationReceipt } from './performance-contract';
 import type { NativeDragReadinessEvent } from './native-drag-readiness';
 
+export interface FolderPrivacyInput { libraryId: string; folderId?: string; action: 'status' | 'protect' | 'unlock' | 'lock' | 'remove' | 'change-password'; password?: string; newPassword?: string; }
+export interface FolderPrivacyState { folderId: string; locked: boolean; }
+
 /** Serpent-xffq：WebDAV 服务端能力探测结果。 */
 export interface SyncCapabilities {
   auth: 'none' | 'basic' | 'digest';
@@ -362,6 +365,7 @@ export interface SerpentLibraryApi {
       historyEntryId?: string;
     }>
   >;
+  folderPrivacy(input: FolderPrivacyInput): Promise<LibraryApiResult<FolderPrivacyState[]>>;
   listFolders(input: { libraryId: string; showIgnored?: boolean }): Promise<LibraryApiResult<ManagedFolderSummary[]>>;
   listFolderBrowseEntries(input: {
     libraryId: string;
@@ -549,6 +553,7 @@ export interface SerpentLibraryApi {
   onLifecycle(listener: (event: RendererLifecycleEvent) => void): () => void;
   onAssetsChanged(listener: (event: AssetChangeEvent) => void): () => void;
   onLibraryChanged(listener: (event: LibraryChangedEvent) => void): () => void;
+  onFolderPrivacyChanged(listener: (event: { type: 'folder.privacy-changed'; libraryId: string }) => void): () => void;
   onExtensionSaveCompleted(
     listener: (event: ExtensionSaveCompletedEvent) => void,
   ): () => void;

@@ -435,6 +435,17 @@ export function parseLibraryChangedEvent(input: unknown): LibraryChangedEvent {
   return libraryChangedEventSchema.parse(input);
 }
 
+export const folderPrivacyChangedEventSchema = z.strictObject({
+  type: z.literal('folder.privacy-changed'),
+  libraryId: nonBlankString,
+});
+
+export type FolderPrivacyChangedEvent = z.infer<typeof folderPrivacyChangedEventSchema>;
+
+export function parseFolderPrivacyChangedEvent(input: unknown): FolderPrivacyChangedEvent {
+  return folderPrivacyChangedEventSchema.parse(input);
+}
+
 export const extensionSaveCompletedEventSchema = z.strictObject({
   type: z.literal('extension.save.completed'),
   libraryId: nonBlankString,
@@ -815,6 +826,15 @@ const assetOperationSuccessSchemas = [
     skippedCount: z.number().int().nonnegative(),
     folders: z.array(managedFolderSummarySchema),
     historyEntryId: nonBlankString.optional(),
+  }),
+  z.strictObject({
+    ok: z.literal(true),
+    type: z.literal('folder.privacy'),
+    libraryId: nonBlankString,
+    states: z.array(z.strictObject({
+      folderId: z.string().min(1).max(4096),
+      locked: z.boolean(),
+    })),
   }),
   z.strictObject({
     ok: z.literal(true),

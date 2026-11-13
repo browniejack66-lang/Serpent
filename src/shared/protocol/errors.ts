@@ -9,6 +9,10 @@ export const PUBLIC_ERROR_MESSAGES = {
   INVALID_LIBRARY_PATH:
     'The selected location is not a usable folder for a library. Choose an existing writable folder — not a file, and not a disconnected drive.',
   INVALID_FOLDER_NAME: 'Choose a folder name that is safe on macOS and Windows.',
+  FOLDER_LOCKED: 'Unlock the protected folder in Serpent before accessing its contents.',
+  FOLDER_PRIVACY_PASSWORD_INVALID: 'The folder password is incorrect.',
+  FOLDER_PRIVACY_PASSWORD_REQUIRED: 'Enter a folder password between 1 and 1024 characters.',
+  FOLDER_PRIVACY_INVALID_ACTION: 'That privacy action is not valid for this folder.',
   INVALID_APPEARANCE: 'Choose an icon or color from the available options.',
   FOLDER_COVER_UNSUPPORTED: 'Choose an image file to use as the cover.',
   FOLDER_COVER_NO_SPACE: 'There is not enough free space to keep this cover with the library.',

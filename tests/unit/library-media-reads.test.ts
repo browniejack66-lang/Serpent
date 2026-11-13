@@ -11,6 +11,7 @@ import {
 const LIBRARY_ID = 'lib-delete-reads';
 
 afterEach(() => {
+  endLibraryDeleteMediaFence(LIBRARY_ID);
   unblockLibraryMediaReads(LIBRARY_ID);
 });
 

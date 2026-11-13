@@ -258,6 +258,7 @@ import {
   APP_LOCALE_CHANNEL,
   LIBRARY_LIFECYCLE_CHANNEL,
   LIBRARY_CHANGED_CHANNEL,
+  FOLDER_PRIVACY_CHANGED_CHANNEL,
   LIBRARY_REQUEST_CHANNEL,
   PROGRESS_CHANNEL,
   AI_PROGRESS_CHANNEL,
@@ -504,6 +505,7 @@ import {
   type AiAnalysisPreferences,
 } from "./ai-analysis-preferences";
 import { createArtifactResponse } from "./artifact-response";
+import { createFolderPrivacyTransition } from "./folder-privacy-transition";
 import { PreviewCache } from "./preview-cache";
 import {
   bindLibraryMediaReadSignal,
@@ -521,6 +523,7 @@ import {
 import { renderDocumentThumbnail } from "./document-thumbnail-renderer";
 import {
   clearModelThumbnailSourceAuthorizations,
+  clearLibraryModelThumbnailSourceAuthorizations,
   registerModelThumbnailSourceAuthorizations,
   resolveModelThumbnailSourceAuthorization,
 } from "./model-thumbnail-source-cache";
@@ -540,6 +543,12 @@ import {
   recordExtensionBrowseFolder,
 } from "./extension-recent-browse-folders";
 import { resolveExtensionSaveRouting } from "./extension-save-context";
+import {
+  fetchExtensionPrivacyView,
+  filterExtensionFolders,
+  filterExtensionRecentIds,
+  validateExtensionSaveTarget,
+} from "./extension-folder-privacy";
 import { RelinkPreviewStore } from "./relink-preview-store";
 import {
   cleanupClipboardImage,
@@ -2546,7 +2555,7 @@ async function handleListFolders(): Promise<ListFoldersDisposition> {
   if (!result.ok) {
     return {
       ok: false,
-      status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : 422,
+      status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : result.error.code === "FOLDER_LOCKED" ? 403 : 422,
       reason: result.error.reason ?? result.error.code,
     };
   }
@@ -2599,10 +2608,20 @@ async function handleListFolders(): Promise<ListFoldersDisposition> {
     });
   }
 
+  const privacyView = await fetchExtensionPrivacyView(
+    (command) => workerClient!.request(command),
+    saveContext.libraryId,
+    [...result.folders, ...(linkedResult.ok && linkedResult.type === "linked-folder.list" ? linkedResult.folders : [])],
+  );
+  if (!privacyView.stateConfirmed || !linkedResult.ok) {
+    return { ok: false, status: 503, reason: "folder privacy state unavailable" };
+  }
+
   return {
     ok: true,
     libraryDisplayName,
-    recentBrowsedFolderIds: (() => {
+    privacyRevision: privacyView.privacyRevision,
+    recentBrowsedFolderIds: filterExtensionRecentIds((() => {
       let ids = extensionBrowseFoldersStorePath
         ? readExtensionBrowseFolderIds(
             extensionBrowseFoldersStorePath,
@@ -2616,8 +2635,8 @@ async function handleListFolders(): Promise<ListFoldersDisposition> {
         ];
       }
       return ids;
-    })(),
-    folders: [
+    })(), privacyView.hiddenFolderIds, privacyView.visibleFolderIds),
+    folders: filterExtensionFolders([
       ...result.folders.map((folder) => ({
         folderId: folder.folderId,
         name: folder.name,
@@ -2625,7 +2644,7 @@ async function handleListFolders(): Promise<ListFoldersDisposition> {
         assetCount: folder.directAssetCount,
       })),
       ...linkedExtensionFolders,
-    ],
+    ], privacyView.hiddenFolderIds, privacyView.visibleFolderIds),
   };
 }
 
@@ -2646,7 +2665,7 @@ async function handleListCollections(): Promise<ListCollectionsDisposition> {
   if (!result.ok) {
     return {
       ok: false,
-      status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : 422,
+      status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : result.error.code === "FOLDER_LOCKED" ? 403 : 422,
       reason: result.error.reason ?? result.error.code,
     };
   }
@@ -2663,9 +2682,16 @@ async function handleListCollections(): Promise<ListCollectionsDisposition> {
     if (match?.displayName) libraryDisplayName = match.displayName;
   }
 
+  const privacyView = await fetchExtensionPrivacyView(
+    (command) => workerClient!.request(command), saveContext.libraryId,
+  );
+  if (!privacyView.stateConfirmed) {
+    return { ok: false, status: 503, reason: "folder privacy state unavailable" };
+  }
   return {
     ok: true,
     libraryDisplayName,
+    privacyRevision: privacyView.privacyRevision,
     collections: extensionCollectionSummaries(result.collections),
   };
 }
@@ -2696,10 +2722,20 @@ async function handleSaveIntent(
     return { accepted: false, status: 503, reason: "no active library" };
   }
 
-  const targetFolderId =
-    intent.targetFolderId !== undefined
-      ? intent.targetFolderId ?? undefined
-      : saveContext.selectedFolderId;
+  const privacyView = await fetchExtensionPrivacyView(
+    (command) => workerClient!.request(command), saveContext.libraryId,
+  );
+  const verdict = validateExtensionSaveTarget({
+    targetFolderId: intent.targetFolderId,
+    selectedFolderId: saveContext.selectedFolderId,
+    hiddenFolderIds: privacyView.hiddenFolderIds,
+    visibleFolderIds: privacyView.visibleFolderIds,
+    stateConfirmed: privacyView.stateConfirmed,
+  });
+  if (!verdict.ok) {
+    return { accepted: false, status: verdict.status, reason: verdict.reason };
+  }
+  const targetFolderId = verdict.targetFolderId ?? undefined;
 
   const command: WorkerCommand = {
     type: "extension.save-from-url",
@@ -2723,7 +2759,7 @@ async function handleSaveIntent(
       );
       return {
         accepted: false,
-        status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : 422,
+        status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : result.error.code === "FOLDER_LOCKED" ? 403 : 422,
         reason: result.error.reason ?? result.error.code,
       };
     }
@@ -2745,48 +2781,57 @@ async function handleSaveIntent(
 async function handleSaveUpload(
   upload: SaveUploadRequest,
 ): Promise<SaveUploadDisposition> {
-  if (!workerClient) {
-    return { accepted: false, status: 503, reason: "worker unavailable" };
-  }
-
-  const focusedWindow = BrowserWindow.getFocusedWindow();
-  const saveRouting = getExtensionSaveRouting();
-  const saveContext = saveRouting.context;
-  if (!saveContext) {
-    logger?.info(
-      "extension-server.save-upload",
-      focusedWindow
-        ? "No active library in focused window; dropping upload."
-        : "No focused Serpent window and no fallback browse context; dropping upload.",
-      {
-        focusedWindowId: focusedWindow?.id ?? null,
-        lastTargetWindowId: lastExtensionTargetWindowId ?? null,
-        mainWindowId:
-          mainWindow && !mainWindow.isDestroyed() ? mainWindow.id : null,
-        contextWindowCount: focusedContexts.size,
-      },
-    );
-    return { accepted: false, status: 503, reason: "no active library" };
-  }
-
-  const targetFolderId = upload.targetCollectionId
-    ? undefined
-    : upload.targetFolderId !== undefined
-      ? upload.targetFolderId ?? undefined
-      : saveContext.selectedFolderId;
-
-  const command: WorkerCommand = {
-    type: "extension.save-from-file",
-    libraryId: saveContext.libraryId,
-    targetFolderId,
-    sourcePageUrl: upload.sourcePageUrl,
-    mediaUrl: upload.mediaUrl,
-    stagedFilePath: upload.stagedFilePath,
-    contentType: upload.contentType,
-    filename: upload.filename,
-  };
-
   try {
+    if (!workerClient) {
+      return { accepted: false, status: 503, reason: "worker unavailable" };
+    }
+
+    const focusedWindow = BrowserWindow.getFocusedWindow();
+    const saveRouting = getExtensionSaveRouting();
+    const saveContext = saveRouting.context;
+    if (!saveContext) {
+      logger?.info(
+        "extension-server.save-upload",
+        focusedWindow
+          ? "No active library in focused window; dropping upload."
+          : "No focused Serpent window and no fallback browse context; dropping upload.",
+        {
+          focusedWindowId: focusedWindow?.id ?? null,
+          lastTargetWindowId: lastExtensionTargetWindowId ?? null,
+          mainWindowId:
+            mainWindow && !mainWindow.isDestroyed() ? mainWindow.id : null,
+          contextWindowCount: focusedContexts.size,
+        },
+      );
+      return { accepted: false, status: 503, reason: "no active library" };
+    }
+
+    const privacyView = await fetchExtensionPrivacyView(
+      (command) => workerClient!.request(command), saveContext.libraryId,
+    );
+    const verdict = validateExtensionSaveTarget({
+      targetFolderId: upload.targetCollectionId ? null : upload.targetFolderId,
+      selectedFolderId: saveContext.selectedFolderId,
+      hiddenFolderIds: privacyView.hiddenFolderIds,
+      visibleFolderIds: privacyView.visibleFolderIds,
+      stateConfirmed: privacyView.stateConfirmed,
+    });
+    if (!verdict.ok) {
+      return { accepted: false, status: verdict.status, reason: verdict.reason };
+    }
+    const targetFolderId = verdict.targetFolderId ?? undefined;
+
+    const command: WorkerCommand = {
+      type: "extension.save-from-file",
+      libraryId: saveContext.libraryId,
+      targetFolderId,
+      sourcePageUrl: upload.sourcePageUrl,
+      mediaUrl: upload.mediaUrl,
+      stagedFilePath: upload.stagedFilePath,
+      contentType: upload.contentType,
+      filename: upload.filename,
+    };
+
     const result = await workerClient.request(command);
     if (!result.ok) {
       logger?.error(
@@ -2799,7 +2844,7 @@ async function handleSaveUpload(
       );
       return {
         accepted: false,
-        status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : 422,
+        status: result.error.code === "LIBRARY_NOT_OPEN" ? 503 : result.error.code === "FOLDER_LOCKED" ? 403 : 422,
         reason: result.error.reason ?? result.error.code,
       };
     }
@@ -2957,6 +3002,33 @@ function publishAssetChange(event: AssetChangeEvent): void {
     parsed,
   );
 }
+
+const runFolderPrivacyTransition = createFolderPrivacyTransition({
+  request: (command) => {
+    if (!workerClient) throw new Error("Library Worker is unavailable.");
+    return workerClient.request(command);
+  },
+  beginFence: beginLibraryDeleteMediaFence,
+  endFence: endLibraryDeleteMediaFence,
+  invalidate: (libraryId) => {
+    sourcePathCache.clearLibrary(libraryId);
+    clearArtifactPathCache(libraryId);
+    clearNativeAssetDragCache(libraryId);
+    clearLibraryModelThumbnailSourceAuthorizations(libraryId);
+    pendingRelinkPreviews.clearLibrary(libraryId);
+    for (const [offerId, entry] of pendingImageSequenceOffers) {
+      if (entry.offer.libraryId === libraryId) pendingImageSequenceOffers.delete(offerId);
+    }
+  },
+  publish: (libraryId) => {
+    extensionServer?.notifyPrivacyChanged();
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) {
+        window.webContents.send(FOLDER_PRIVACY_CHANGED_CHANNEL, { type: "folder.privacy-changed", libraryId });
+      }
+    }
+  },
+});
 
 function publishLibraryChanged(event: LibraryChangedEvent): void {
   const parsed = parseLibraryChangedEvent(event);
@@ -3313,6 +3385,7 @@ async function commandFor(
         rememberExternalSource,
       }, callbacks);
     }
+    case "folder.privacy.request":
     case "folder.create.request":
     case "folder.rename.request":
     case "appearance.set.request":
@@ -3936,7 +4009,9 @@ async function handleLibraryRequest(
       ? performance.now()
       : 0;
     const navigationWorkerStartedAt = navigationTrace ? performance.now() : 0;
-    const workerResult = command.type === "sync.probe"
+    const workerResult = command.type === "folder.privacy"
+      ? await runFolderPrivacyTransition(command)
+      : command.type === "sync.probe"
       ? await runSyncProbeWithRetry(command, (probe) => {
         if (!workerClient) throw new Error("Library Worker is unavailable.");
         return workerClient.request(probe);
@@ -5038,6 +5113,13 @@ async function startApplication(): Promise<void> {
   });
   workerClient.onModelThumbnailRenderRequest((request, sourceAuthorizations) => {
     const renderer = offscreenThumbnailRenderer;
+    if (isLibraryMediaReadBlocked(request.libraryId)) {
+      return Promise.resolve({
+        status: "failed" as const,
+        errorCode: "MODEL_RENDER_ABORTED",
+        reason: "library media access changed",
+      });
+    }
     if (!renderer) {
       return Promise.resolve({
         status: "failed" as const,
@@ -5045,8 +5127,12 @@ async function startApplication(): Promise<void> {
         reason: "offscreen thumbnail renderer unavailable",
       });
     }
+    const signal = bindLibraryMediaReadSignal(request.libraryId);
+    const cancel = () => renderer.cancelModelThumbnail(request.requestId);
+    signal.addEventListener("abort", cancel, { once: true });
     registerModelThumbnailSourceAuthorizations(sourceAuthorizations);
     return renderer.renderModelThumbnail(request).finally(() => {
+      signal.removeEventListener("abort", cancel);
       clearModelThumbnailSourceAuthorizations(sourceAuthorizations);
     });
   });
@@ -5055,9 +5141,18 @@ async function startApplication(): Promise<void> {
   });
   // Serpent-8ca259: HTML document thumbnails capture the source in a fresh
   // offscreen window in Main; the Worker persists the artifact bytes.
-  workerClient.onDocumentThumbnailRenderRequest((request) =>
-    renderDocumentThumbnail(request, logger!),
-  );
+  workerClient.onDocumentThumbnailRenderRequest((request) => {
+    const url = new URL(request.url);
+    const libraryId = url.pathname.split("/")[1];
+    if (url.protocol !== "serpent:" || url.hostname !== "source" || !libraryId) {
+      return Promise.resolve({
+        status: "failed" as const,
+        errorCode: "DOCUMENT_LOAD_FAILED" as const,
+        reason: "invalid document source",
+      });
+    }
+    return renderDocumentThumbnail(request, logger!, bindLibraryMediaReadSignal(libraryId));
+  });
   automationExecutionJournal = new AutomationExecutionJournal({
     store: createJsonFileAutomationExecutionStore(
       path.join(app.getPath('userData'), 'automation-executions.json'),
@@ -6315,6 +6410,7 @@ async function startApplication(): Promise<void> {
         if (isLibraryMediaReadBlocked(folderLibraryId)) {
           return new Response("Library unavailable", { status: 410 });
         }
+        const folderReadSignal = bindLibraryMediaReadSignal(folderLibraryId, request.signal);
         if (!workerClient) return new Response("Worker unavailable", { status: 503 });
         try {
           const resolved = await workerClient.request({
@@ -6330,7 +6426,7 @@ async function startApplication(): Promise<void> {
             resolved.mimeType,
             {
               rangeHeader: request.headers.get("range"),
-              signal: bindLibraryMediaReadSignal(folderLibraryId, request.signal),
+              signal: folderReadSignal,
               onStreamError: (error) =>
                 logger?.error("serpent-protocol.folder-cover-stream", error, {
                   libraryId: folderLibraryId,
@@ -6401,7 +6497,7 @@ async function startApplication(): Promise<void> {
             pendingFrame.mimeType,
             {
               rangeHeader: request.headers.get("range"),
-              signal: request.signal,
+              signal: bindLibraryMediaReadSignal(pending.offer.libraryId, request.signal),
               onStreamError: (error) =>
                 logger?.error("serpent-protocol.import-frame-stream", error, {
                   sequenceIndex,
@@ -6451,6 +6547,8 @@ async function startApplication(): Promise<void> {
         return new Response("Worker unavailable", { status: 503 });
       }
 
+      // Capture authorization lifetime before asynchronous path resolution.
+      const libraryReadSignal = bindLibraryMediaReadSignal(libraryId, request.signal);
       if (url.hostname === "source") {
         const sourceWorkerClient = workerClient;
         if (!sourceWorkerClient) {
@@ -6507,7 +6605,7 @@ async function startApplication(): Promise<void> {
               authorizedSource.mimeType,
               {
                 rangeHeader: request.headers.get("range"),
-                signal: bindLibraryMediaReadSignal(libraryId, request.signal),
+                signal: libraryReadSignal,
                 onStreamError: (error) =>
                   logger?.error("serpent-protocol.model-source-stream", error, {
                     libraryId,
@@ -6580,7 +6678,7 @@ async function startApplication(): Promise<void> {
             sourceResult.mimeType,
             {
               rangeHeader: request.headers.get("range"),
-              signal: bindLibraryMediaReadSignal(libraryId, request.signal),
+              signal: libraryReadSignal,
               onStreamError: (error) =>
                 logger?.error("serpent-protocol.source-stream", error, {
                   libraryId,
@@ -6637,7 +6735,7 @@ async function startApplication(): Promise<void> {
             mimeType,
             {
               rangeHeader: request.headers.get("range"),
-              signal: bindLibraryMediaReadSignal(libraryId, request.signal),
+              signal: libraryReadSignal,
               onStreamError: (error) =>
                 logger?.error("preview-cache.stream", error, {
                   libraryId,
@@ -6657,7 +6755,7 @@ async function startApplication(): Promise<void> {
           mimeType,
           {
             rangeHeader: request.headers.get("range"),
-            signal: bindLibraryMediaReadSignal(libraryId, request.signal),
+            signal: libraryReadSignal,
             onStreamError: (error) =>
               logger?.error("serpent-protocol.stream", error, {
                 libraryId,

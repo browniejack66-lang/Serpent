@@ -55,7 +55,8 @@ export function FolderCard({
   filteredCount,
 }: FolderCardProps) {
   const t = useT();
-  const customCover = entry.hasCustomCover ? folderCoverImageSrc(libraryId, entry) : null;
+  const locked = entry.privacy?.locked === true;
+  const customCover = !locked && entry.hasCustomCover ? folderCoverImageSrc(libraryId, entry) : null;
   const [failedSrcs, setFailedSrcs] = useState<ReadonlySet<string>>(() => new Set());
   const [failedFor, setFailedFor] = useState(entry.folderId);
   if (failedFor !== entry.folderId) {
@@ -130,7 +131,7 @@ export function FolderCard({
             />
           </svg>
           <div className="folder-card-pocket">
-            {customSrc ? (
+            {locked ? <div className="folder-card-cover-empty"><Icon name="lock" size={28} /></div> : customSrc ? (
               <div className="folder-card-cover-photo">
                 <img
                   alt=""
@@ -203,7 +204,7 @@ export function FolderCard({
           {entry.name}
         </strong>
         <span className="folder-card-count">
-          {t("common.itemCount", {
+          {locked ? "Protected" : t("common.itemCount", {
             count: filteredCount === undefined
               ? entry.recursiveAssetCount
               : filteredCount,

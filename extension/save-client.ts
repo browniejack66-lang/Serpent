@@ -1,4 +1,5 @@
 import type { ExtensionFolderOption } from './folder-menu';
+import { normalizePrivacyRevision } from './folder-privacy';
 
 export const SERPENT_PORTS = [19876, 19877, 19878] as const;
 
@@ -46,6 +47,8 @@ export type FolderListOutcome =
       folders: ExtensionFolderOption[];
       recentBrowsedFolderIds: string[];
       libraryDisplayName: string;
+      /** null = privacy state unconfirmed; consumers MUST fail closed. */
+      privacyRevision: string | null;
     }
   | { kind: 'rejected'; status: number; reason: string }
   | { kind: 'unreachable' };
@@ -151,11 +154,18 @@ function parseFolderList(body: string): {
   folders: ExtensionFolderOption[];
   recentBrowsedFolderIds: string[];
   libraryDisplayName: string;
+  privacyRevision: string | null;
 } {
   const parsed = JSON.parse(body) as unknown;
   if (!parsed || typeof parsed !== 'object') {
-    return { folders: [], recentBrowsedFolderIds: [], libraryDisplayName: 'Serpent' };
+    return {
+      folders: [],
+      recentBrowsedFolderIds: [],
+      libraryDisplayName: 'Serpent',
+      privacyRevision: null,
+    };
   }
+  const privacyRevision = normalizePrivacyRevision(Reflect.get(parsed, 'privacyRevision'));
   const folders = Reflect.get(parsed, 'folders');
   const recentBrowsedFolderIds = Reflect.get(parsed, 'recentBrowsedFolderIds');
   const libraryDisplayNameValue = Reflect.get(parsed, 'libraryDisplayName');
@@ -169,6 +179,7 @@ function parseFolderList(body: string): {
     const name = Reflect.get(entry, 'name');
     const relativePath = Reflect.get(entry, 'relativePath');
     const assetCount = Reflect.get(entry, 'assetCount');
+    const privacyValue = Reflect.get(entry, 'privacy');
     if (
       typeof folderId !== 'string' ||
       typeof name !== 'string' ||
@@ -176,10 +187,18 @@ function parseFolderList(body: string): {
     ) {
       return [];
     }
+    const privacy =
+      privacyValue && typeof privacyValue === 'object'
+        ? {
+            protected: Reflect.get(privacyValue, 'protected') === true,
+            locked: Reflect.get(privacyValue, 'locked') === true,
+          }
+        : null;
     return [{
       folderId,
       name,
       relativePath,
+      ...(privacy ? { privacy } : {}),
       ...(typeof assetCount === 'number' && Number.isFinite(assetCount)
         ? { assetCount: Math.max(0, Math.floor(assetCount)) }
         : {}),
@@ -188,7 +207,12 @@ function parseFolderList(body: string): {
   const browsed = Array.isArray(recentBrowsedFolderIds)
     ? recentBrowsedFolderIds.filter((entry): entry is string => typeof entry === 'string')
     : [];
-  return { folders: folderList, recentBrowsedFolderIds: browsed, libraryDisplayName };
+  return {
+    folders: folderList,
+    recentBrowsedFolderIds: browsed,
+    libraryDisplayName,
+    privacyRevision,
+  };
 }
 
 export async function fetchSerpentFolders(
@@ -211,6 +235,7 @@ export async function fetchSerpentFolders(
       folders: parsed.folders,
       recentBrowsedFolderIds: parsed.recentBrowsedFolderIds,
       libraryDisplayName: parsed.libraryDisplayName,
+      privacyRevision: parsed.privacyRevision,
     };
   }
 
@@ -463,6 +488,14 @@ export function notificationForOutcome(outcome: SaveOutcome): UserNotification {
         message: 'Serpent 已接收保存请求。',
       };
     case 'rejected':
+      // Serpent #91 / PR 92: a protected / stale / unconfirmed target must be
+      // re-picked, never silently saved to the library root.
+      if (outcome.status === 403 && outcome.reason.includes('重新选择可用目录')) {
+        return {
+          title: '请重新选择可用目录',
+          message: outcome.reason,
+        };
+      }
       return {
         title: 'Serpent 拒绝了保存请求',
         message: `HTTP ${outcome.status}：${outcome.reason}`,

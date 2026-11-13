@@ -64,6 +64,7 @@ import { isLibraryRootFolderId } from "../shared/library-root-folder";
 import {
   buildUnifiedDirectoryNavEntries,
   hideOfflineLinkedDirectoryEntries,
+  hideLockedDirectoryDescendants,
   filterCollapsedDirectoryEntries,
   filterCollectionTreeByName,
   filterDirectoryEntriesByName,
@@ -1312,7 +1313,7 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
   }
 
   const unifiedDirectoryEntries = useMemo(() => {
-    const entries = buildUnifiedDirectoryNavEntries(folders, linkedFolders);
+    const entries = hideLockedDirectoryDescendants(buildUnifiedDirectoryNavEntries(folders, linkedFolders));
     return showMissingLinkedFiles
       ? entries
       : hideOfflineLinkedDirectoryEntries(entries);
@@ -2120,12 +2121,12 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
         return (
           <NavRow
             active={isManagedFolderNavActive(browseNavFlags, entry.folderId)}
-            count={filteredFolderCounts
+            count={entry.privacy?.locked ? undefined : filteredFolderCounts
               ? filteredFolderCounts.byFolderId.get(entry.folderId) ?? 0
               : entry.directAssetCount}
             depth={entry.depth}
             disclosure={
-              hasChildren ? (
+              hasChildren && !entry.privacy?.locked ? (
                 <button
                   aria-expanded={expanded}
                   aria-label={
@@ -2144,8 +2145,8 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
                 </button>
               ) : undefined
             }
-            icon="folder"
-            appearance={entry.appearance}
+            icon={entry.privacy?.locked ? "lock" : entry.privacy?.protected ? "unlock" : "folder"}
+            appearance={entry.privacy?.locked ? null : entry.appearance}
             key={entry.folderId}
             label={entry.name}
             navFolderId={entry.folderId}
@@ -2238,8 +2239,9 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
       }
       const offline = entry.status === "offline";
       const linkedAffordance = linkedFolderNavAffordance(entry.status);
-      const hasChildren = foldersWithChildren.has(entry.folderId);
-      const expanded = !collapsedFolderIds.has(entry.folderId);
+      const locked = entry.privacy?.locked === true;
+      const hasChildren = !locked && foldersWithChildren.has(entry.folderId);
+      const expanded = !locked && !collapsedFolderIds.has(entry.folderId);
       const linkedRootId = entry.linkedFolderId;
       const hasCustomLinkedGlyph = Boolean(entry.appearance?.glyphKind);
       return (
@@ -2247,7 +2249,7 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
           active={isManagedFolderNavActive(browseNavFlags, entry.folderId)}
           depth={entry.depth}
           disclosure={
-            hasChildren ? (
+            hasChildren && !locked ? (
               <button
                 aria-expanded={expanded}
                 aria-label={
@@ -2266,8 +2268,8 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
               </button>
             ) : undefined
           }
-          icon={hasCustomLinkedGlyph ? "folder" : linkedAffordance.icon}
-          appearance={entry.appearance}
+          icon={locked ? "lock" : entry.privacy?.protected ? "unlock" : hasCustomLinkedGlyph ? "folder" : linkedAffordance.icon}
+          appearance={locked ? null : entry.appearance}
           linkedBadge={hasCustomLinkedGlyph ? (offline ? "link-off" : "link") : undefined}
           iconColor={hasCustomLinkedGlyph ? undefined : linkedAffordance.iconColor}
           key={entry.folderId}
@@ -2275,10 +2277,10 @@ export function NavigationSidebar(props: NavigationSidebarProps) {
           navFolderId={entry.folderId}
           navFolderKind="linked"
           multiSelected={selectedFolderIds.includes(entry.folderId)}
-          count={filteredFolderCounts
+          count={locked ? undefined : filteredFolderCounts
             ? filteredFolderCounts.byFolderId.get(entry.folderId) ?? 0
             : entry.assetCount}
-          title={linkedFolderHoverDetail(
+          title={locked ? t("folderPrivacy.locked") : linkedFolderHoverDetail(
             entry.status,
             lf.absoluteRootPath,
             {

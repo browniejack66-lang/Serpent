@@ -54,10 +54,14 @@ interface FolderListResponse {
   recentFolderIds?: string[];
   recentBrowsedFolderIds?: string[];
   libraryDisplayName?: string;
+  // Serpent #91 / PR 92: opaque desktop privacy revision. Never null on 'ok'.
+  privacyRevision?: string | null;
 }
 
+// 'privacy-unconfirmed' means the desktop could not confirm the privacy state.
+// Consumers MUST fail closed instead of falling back to a root-only menu.
 interface FolderListErrorResponse {
-  kind: 'rejected' | 'unreachable';
+  kind: 'rejected' | 'unreachable' | 'privacy-unconfirmed';
 }
 
 interface SaveResponse {
@@ -1028,6 +1032,16 @@ function closeMenu(): void {
   hostEl = null;
 }
 
+// Serpent #91 / PR 92: bumped whenever the desktop privacy revision changes.
+// An in-flight startRadialSaveMenu() must not open a menu built from stale data.
+let menuGeneration = 0;
+
+/** Close an open radial menu and invalidate any menu still being built. */
+export function closeRadialSaveMenu(): void {
+  menuGeneration += 1;
+  closeMenu();
+}
+
 function openMenu(
   clientX: number,
   clientY: number,
@@ -1129,6 +1143,7 @@ export async function startRadialSaveMenu(
 ): Promise<void> {
   if (state) return;
 
+  const generation = menuGeneration;
   let dragEndedEarly = false;
   const earlyEnd = (): void => {
     dragEndedEarly = true;
@@ -1161,6 +1176,17 @@ export async function startRadialSaveMenu(
       const response = await sendRuntimeMessage<FolderListResponse | FolderListErrorResponse>({
         type: 'serpent-list-folders',
       });
+      if (response.kind === 'privacy-unconfirmed') {
+        if (!dragEndedEarly && generation === menuGeneration) {
+          showSaveBubble(
+            clientX,
+            clientY,
+            '请重新选择可用目录',
+            '暂时无法确认 Serpent 的目录隐私状态，请稍后重试。',
+          );
+        }
+        return;
+      }
       if (response.kind === 'ok') {
         const tree = buildFolderTree(response.folders);
         const hints = buildSaveMenuFolderHints(
@@ -1189,7 +1215,7 @@ export async function startRadialSaveMenu(
       // 文件夹列表失败时降级为仅库名父节点
     }
 
-    if (dragEndedEarly) return;
+    if (dragEndedEarly || generation !== menuGeneration) return;
     openMenu(clientX, clientY, media, context);
   } finally {
     document.removeEventListener('dragend', earlyEnd, { capture: true });

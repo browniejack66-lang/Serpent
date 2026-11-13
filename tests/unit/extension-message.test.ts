@@ -477,6 +477,7 @@ describe('createExtensionServer', () => {
       ],
       recentBrowsedFolderIds: [],
       libraryDisplayName: '演示库',
+      privacyRevision: null,
     });
   });
 
@@ -523,6 +524,7 @@ describe('createExtensionServer', () => {
         },
       ],
       libraryDisplayName: '演示库',
+      privacyRevision: null,
     });
   });
 

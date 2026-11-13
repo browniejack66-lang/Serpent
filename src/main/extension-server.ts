@@ -26,11 +26,19 @@ export const saveIntentSchema = z.strictObject({
 
 export type SaveIntent = z.infer<typeof saveIntentSchema>;
 
+/** Optional privacy summary on folder summaries (Serpent #91 / PR 92).
+ * The extension never needs these flags to decide what to show — the desktop
+ * has already removed protected scopes from the list — but carrying them lets
+ * clients apply defence-in-depth filtering without a second request. */
 export const extensionFolderSchema = z.strictObject({
   folderId: z.string().min(1),
   name: z.string().min(1),
   relativePath: z.string().min(1),
   assetCount: z.number().int().nonnegative().optional(),
+  privacy: z.strictObject({
+    protected: z.boolean(),
+    locked: z.boolean(),
+  }).optional(),
 });
 
 export type ExtensionFolderSummary = z.infer<typeof extensionFolderSchema>;
@@ -41,6 +49,10 @@ export type ListFoldersDisposition =
       folders: ExtensionFolderSummary[];
       recentBrowsedFolderIds: string[];
       libraryDisplayName: string;
+      /** Confirmed privacy state revision. `null` means "unconfirmed" and
+       * clients MUST fail closed. Optional in TS for backwards compatibility;
+       * the HTTP response always emits the field. */
+      privacyRevision?: string | null;
     }
   | { ok: false; status: number; reason: string };
 
@@ -56,6 +68,8 @@ export type ListCollectionsDisposition =
       ok: true;
       collections: ExtensionCollectionSummary[];
       libraryDisplayName: string;
+      /** See ListFoldersDisposition. Always emitted by the HTTP response. */
+      privacyRevision?: string | null;
     }
   | { ok: false; status: number; reason: string };
 
@@ -157,6 +171,17 @@ export type SaveIntentDisposition =
 export interface ExtensionServer {
   server: http.Server;
   port: number;
+  /**
+   * Signal that the folder-privacy state changed (protect / unlock / lock /
+   * remove / change-password). Bumps an opaque monotonic generation and
+   * resolves every pending GET /privacy-events long-poll immediately, so an
+   * extension watcher can invalidate cached menus + recents within a moment
+   * instead of waiting for its 30s connection alarm.
+   *
+   * The generation is an integer with NO folder ids or library ids — it
+   * reveals nothing about which folder changed.
+   */
+  notifyPrivacyChanged: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +212,13 @@ const MAX_SAVE_JSON_BYTES = 16 * 1024;
 /** Same cap as Worker remote download (500 MB). */
 export const MAX_EXTENSION_UPLOAD_BYTES = 500 * 1024 * 1024;
 const UPLOAD_STAGE_PREFIX = 'serpent-ext-upload-';
+
+/**
+ * Upper bound on how long a GET /privacy-events long-poll may be held open
+ * before answering with the current generation (heartbeat). Keeps a polite
+ * client from holding a socket forever and lets it detect a dead server.
+ */
+export const PRIVACY_EVENTS_MAX_HOLD_MS = 20_000;
 
 function jsonResponse(
   res: http.ServerResponse,
@@ -331,11 +363,14 @@ function sizeLimitTransform(maxBytes: number): {
 /**
  * Starts a lightweight HTTP server bound to 127.0.0.1. Accepts:
  *
- *   GET  /ping         → 200 {"app":"Serpent"}
- *   GET  /folders      → 200 {"folders":[...]} on success
- *   GET  /collections  → 200 {"collections":[...]} on success
- *   POST /save         → 202 on valid save-intent JSON (desktop re-download)
- *   POST /save-upload  → 202 after browser-fetched bytes are staged (preferred)
+ *   GET  /ping          → 200 {"app":"Serpent"}
+ *   GET  /folders       → 200 {"folders":[...]} on success
+ *   GET  /collections   → 200 {"collections":[...]} on success
+ *   GET  /privacy-events?since=<n> → long-poll; resolves to {"generation":N}
+ *                          as soon as the privacy generation advances past <n>,
+ *                          or after a bounded heartbeat timeout. Opaque ints.
+ *   POST /save          → 202 on valid save-intent JSON (desktop re-download)
+ *   POST /save-upload   → 202 after browser-fetched bytes are staged (preferred)
  *
  * Only loopback connections (127.0.0.1, ::1) are accepted. No pairing token
  * (Serpent-1cxv): identity is loopback + optional chrome-extension Origin.
@@ -345,6 +380,34 @@ export async function createExtensionServer(
 ): Promise<ExtensionServer> {
   const startPort = options.port ?? 19876;
   const maxPort = startPort + 2;
+
+  // Start above the client baseline so its first poll responds immediately;
+  // subsequent polls at this generation wait, even before any privacy change.
+  // No folder or library identity is ever encoded.
+  let privacyGeneration = 1;
+  interface PendingPrivacyPoll {
+    res: http.ServerResponse;
+    timer: NodeJS.Timeout;
+  }
+  const pendingPrivacyPolls = new Set<PendingPrivacyPoll>();
+
+  function respondPrivacyGeneration(res: http.ServerResponse): void {
+    if (res.writableEnded || res.destroyed) return;
+    jsonResponse(res, 200, { status: 'ok', generation: privacyGeneration });
+  }
+
+  function settlePrivacyPoll(poll: PendingPrivacyPoll): void {
+    clearTimeout(poll.timer);
+    pendingPrivacyPolls.delete(poll);
+    respondPrivacyGeneration(poll.res);
+  }
+
+  const notifyPrivacyChanged = (): void => {
+    privacyGeneration += 1;
+    for (const poll of [...pendingPrivacyPolls]) {
+      settlePrivacyPoll(poll);
+    }
+  };
 
   const server = http.createServer((req, res) => {
     res.setHeader('Connection', 'close');
@@ -360,6 +423,54 @@ export async function createExtensionServer(
 
     if (req.method === 'GET' && req.url === '/ping') {
       jsonResponse(res, 200, { app: 'Serpent' });
+      return;
+    }
+
+    if (req.method === 'GET' && req.url?.startsWith('/privacy-events')) {
+      if (!isAllowedOrigin(req.headers.origin)) {
+        jsonResponse(res, 403, { status: 'rejected', reason: 'forbidden origin' });
+        req.resume();
+        return;
+      }
+
+      let query: URLSearchParams;
+      try {
+        query = new URL(req.url, 'http://127.0.0.1').searchParams;
+      } catch {
+        jsonResponse(res, 400, { status: 'rejected', reason: 'invalid query' });
+        req.resume();
+        return;
+      }
+      const rawSince = query.get('since');
+      const trimmed = rawSince === null ? '' : rawSince.trim();
+      const since = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+      if (!Number.isInteger(since) || since < 0) {
+        jsonResponse(res, 400, { status: 'rejected', reason: 'invalid since' });
+        req.resume();
+        return;
+      }
+
+      // A new client or a client from a previous server instance gets the
+      // current baseline immediately. Only matching generations are held.
+      if (since !== privacyGeneration) {
+        respondPrivacyGeneration(res);
+        return;
+      }
+
+      // Hold until the generation advances or the heartbeat timeout fires.
+      const poll: PendingPrivacyPoll = {
+        res,
+        timer: setTimeout(() => settlePrivacyPoll(poll), PRIVACY_EVENTS_MAX_HOLD_MS),
+      };
+      // Do not keep the event loop alive solely for a held poll.
+      poll.timer.unref();
+      pendingPrivacyPolls.add(poll);
+      // Drop the poll if the client disconnects before it is answered.
+      res.on('close', () => {
+        clearTimeout(poll.timer);
+        pendingPrivacyPolls.delete(poll);
+      });
+      req.resume();
       return;
     }
 
@@ -384,6 +495,9 @@ export async function createExtensionServer(
             folders: disposition.folders,
             recentBrowsedFolderIds: disposition.recentBrowsedFolderIds,
             libraryDisplayName: disposition.libraryDisplayName,
+            // Always present: an old desktop build that does not set it yields
+            // null, which new extensions treat as unconfirmed and fail closed.
+            privacyRevision: disposition.privacyRevision ?? null,
           });
         })
         .catch((error) => {
@@ -414,6 +528,7 @@ export async function createExtensionServer(
             status: 'ok',
             collections: disposition.collections,
             libraryDisplayName: disposition.libraryDisplayName,
+            privacyRevision: disposition.privacyRevision ?? null,
           });
         })
         .catch((error) => {
@@ -607,6 +722,29 @@ export async function createExtensionServer(
     jsonResponse(res, 404, { status: 'rejected', reason: 'not found' });
   });
 
+  // Drain held long-polls before close so no timer leaks and held sockets are
+  // released (otherwise server.close() waits forever on a held connection).
+  const drainPendingPrivacyPolls = (): void => {
+    for (const poll of [...pendingPrivacyPolls]) {
+      clearTimeout(poll.timer);
+      pendingPrivacyPolls.delete(poll);
+      try {
+        if (!poll.res.writableEnded && !poll.res.destroyed) {
+          poll.res.end();
+        }
+      } catch {
+        // Ignore: the socket may already be gone.
+      }
+    }
+  };
+  const originalClose = server.close.bind(server);
+  server.close = ((callback?: (err?: Error) => void) => {
+    drainPendingPrivacyPolls();
+    return originalClose(callback);
+  }) as typeof server.close;
+  // Belt and braces: a close triggered by another path also drains timers.
+  server.on('close', drainPendingPrivacyPolls);
+
   for (let port = startPort; port <= maxPort; port++) {
     try {
       const boundPort = await new Promise<number>((resolve, reject) => {
@@ -619,7 +757,7 @@ export async function createExtensionServer(
           resolve(port);
         });
       });
-      return { server, port: boundPort };
+      return { server, port: boundPort, notifyPrivacyChanged };
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== 'EADDRINUSE') {

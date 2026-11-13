@@ -62,6 +62,8 @@ export async function executeFolderMainCommand(
         folderIds: request.folderIds,
         assetId: request.assetId,
       };
+    case "folder.privacy.request":
+      return { ...request, type: "folder.privacy" };
     case "folder.list.request":
       return { type: "folder.list", libraryId: request.libraryId, showIgnored: request.showIgnored };
     case "folder.browse-entries.request":

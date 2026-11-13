@@ -2,6 +2,7 @@ import { LocalConfirmationHost, useLocalConfirmation, requestConfirmation } from
 import {
   useCallback,
   useEffect,
+  useEffectEvent,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -11931,6 +11932,30 @@ function AppInner() {
     }
   }
 
+  const revokeFolderPrivacyView = useEffectEvent(() => {
+    // Revoke every renderer-held representation before asking the backend for
+    // a fresh, privacy-filtered snapshot. Broad invalidation also covers
+    // descendants and linked virtual folder IDs without trusting stale scope.
+    // Fence in-flight browse and navigation reads so they cannot repopulate
+    // the just-cleared state after this event.
+    beginLibraryTransition();
+    clearLibraryScopedView();
+    assetsRef.current = [];
+    selectedAssetIdRef.current = undefined;
+    selectedAssetIdsRef.current = [];
+    setPreviewAsset(null);
+    previewAssetRef.current = null;
+    setFolderBrowseRefreshToken((token) => token + 1);
+    setFilteredFolderCountRefreshToken((token) => token + 1);
+    // Recreate subscriptions whose captured view token was just revoked.
+    // The library identity remains the same; all old async tokens are stale.
+    const currentLibrary = libraryRef.current;
+    if (!currentLibrary) return;
+    setLibrary({ ...currentLibrary });
+    void loadContent(currentLibrary, "all", { refreshSidebar: true })
+      .catch(() => undefined);
+  });
+
   useEffect(() => {
     if (!api || !library) return;
     const effectLibraryId = library.libraryId;
@@ -11983,6 +12008,10 @@ function AppInner() {
         scheduleSilentReload();
       }, NETWORK_LIBRARY_RELOAD_INTERVAL_MS - elapsed);
     };
+    const unsubscribePrivacy = api.onFolderPrivacyChanged((event) => {
+      if (event.libraryId !== effectLibraryId || !isEffectLibraryCurrent()) return;
+      revokeFolderPrivacyView();
+    });
     const unsubscribe = api.onAssetsChanged((event) => {
       if (event.libraryId !== effectLibraryId || !isEffectLibraryCurrent()) return;
       setLayoutThumbnailArtifacts({
@@ -12089,6 +12118,7 @@ function AppInner() {
         window.clearTimeout(assetChangeDebounceTimer);
       }
       unsubscribe();
+      unsubscribePrivacy();
       unsubscribeLibraryChanged();
     };
   }, [api, applyLoadedMetadata, library, locale, refreshOperationHistory, setError, setNotice, t]);

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { folderPrivacyInputSchema } from '../folder-privacy';
 
 import {
   filterClauseSchema,
@@ -56,6 +57,10 @@ const linkedSubtreeRelativePathSchema = z.union([
 ]);
 /** Browse/search/reveal ids may be virtual linked paths: `lfv:{rootId}/{relativePath}`. */
 const folderScopeIdSchema = nonBlankString.max(4096);
+const folderPrivacyRequestSchema = folderPrivacyInputSchema.safeExtend({
+  libraryId: identifierSchema,
+  folderId: folderScopeIdSchema.optional(),
+});
 // Schema layer rejects only obvious injection shapes (separators, control
 // characters, dot segments, blank/overlong input). The portable-name semantics
 // (reserved DOS names, trailing space/period, UTF-8 byte limit) are enforced
@@ -347,6 +352,9 @@ export const rendererRequestSchema = z.discriminatedUnion('type', [
     folderIds: z.array(identifierSchema).min(1).max(10_000),
     targetParentFolderId: identifierSchema.nullable(),
     conflictStrategy: z.enum(['keep-both', 'skip']).default('keep-both'),
+  }),
+  folderPrivacyRequestSchema.safeExtend({
+    type: z.literal('folder.privacy.request'),
   }),
   z.strictObject({
     type: z.literal('folder.list.request'),
@@ -1720,6 +1728,9 @@ export const workerCommandSchema = z.discriminatedUnion('type', [
     type: z.literal('folder.get-path'),
     libraryId: identifierSchema,
     folderId: folderScopeIdSchema,
+  }),
+  folderPrivacyRequestSchema.safeExtend({
+    type: z.literal('folder.privacy'),
   }),
   z.strictObject({
     type: z.literal('folder.list'),

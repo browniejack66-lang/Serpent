@@ -9,7 +9,7 @@ function createNavigationId(): string {
 
 import { ipcRenderer, webUtils } from 'electron';
 
-import type { AiJobStatus, LibraryApiResult, LinkedAssetDeleteResult, MediaJobStatus, PluginJobStatus, PreviewResolution, RelinkAssetResult, SerpentLibraryApi, SyncCapabilities, SyncReport } from '../../shared/library-api';
+import type { AiJobStatus, FolderPrivacyInput, FolderPrivacyState, LibraryApiResult, LinkedAssetDeleteResult, MediaJobStatus, PluginJobStatus, PreviewResolution, RelinkAssetResult, SerpentLibraryApi, SyncCapabilities, SyncReport } from '../../shared/library-api';
 import type { EmbeddingInstallProgress } from '../../shared/embedding/install-progress';
 import type { MutationReceipt } from '../../shared/performance-contract';
 import { summarizePluginJobs } from '../../shared/plugin-job-status';
@@ -30,6 +30,7 @@ import {
   ACTIVE_CONTEXT_CHANNEL,
   LIBRARY_LIFECYCLE_CHANNEL,
   LIBRARY_CHANGED_CHANNEL,
+  FOLDER_PRIVACY_CHANGED_CHANNEL,
   PROGRESS_CHANNEL,
   EMBEDDING_INSTALL_PROGRESS_CHANNEL,
   AI_PROGRESS_CHANNEL,
@@ -59,6 +60,7 @@ import {
   parseAssetChangeEvent,
   type LibraryChangedEvent,
   parseLibraryChangedEvent,
+  parseFolderPrivacyChangedEvent,
   type ExtensionSaveCompletedEvent,
   parseExtensionSaveCompletedEvent,
   type ExportProgressEvent,
@@ -532,6 +534,13 @@ export const library: SerpentLibraryApi = Object.freeze({
         ...(result.historyEntryId ? { historyEntryId: result.historyEntryId } : {}),
       },
     };
+  },
+
+  async folderPrivacy(input: FolderPrivacyInput): Promise<LibraryApiResult<FolderPrivacyState[]>> {
+    const result = await request({ type: 'folder.privacy.request', ...input });
+    if (!result.ok) return failure(result);
+    if (result.type !== 'folder.privacy') throw new Error('Unexpected folder privacy response.');
+    return { ok: true, value: result.states };
   },
 
   async listFolders({ libraryId, showIgnored }: { libraryId: string; showIgnored?: boolean }): Promise<LibraryApiResult<ManagedFolderSummary[]>> {
@@ -1785,6 +1794,14 @@ export const library: SerpentLibraryApi = Object.freeze({
     };
     ipcRenderer.on(LIBRARY_CHANGED_CHANNEL, subscription);
     return () => ipcRenderer.removeListener(LIBRARY_CHANGED_CHANNEL, subscription);
+  },
+
+  onFolderPrivacyChanged(listener: (event: { type: 'folder.privacy-changed'; libraryId: string }) => void) {
+    const subscription = (_event: Electron.IpcRendererEvent, input: unknown) => {
+      listener(parseFolderPrivacyChangedEvent(input));
+    };
+    ipcRenderer.on(FOLDER_PRIVACY_CHANGED_CHANNEL, subscription);
+    return () => ipcRenderer.removeListener(FOLDER_PRIVACY_CHANGED_CHANNEL, subscription);
   },
 
   onExtensionSaveCompleted(listener: (event: ExtensionSaveCompletedEvent) => void) {

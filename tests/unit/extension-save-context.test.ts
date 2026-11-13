@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveExtensionSaveContext, resolveExtensionSaveRouting } from "../../src/main/extension-save-context";
+import {
+  extensionSaveContextHidden,
+  resolveExtensionSaveContext,
+  resolveExtensionSaveRouting,
+} from "../../src/main/extension-save-context";
 import type { ActiveContext } from "../../src/shared/protocol/requests";
 
 function contexts(
@@ -83,5 +87,30 @@ describe("resolveExtensionSaveContext", () => {
         selectedFolderId: "folder-a",
       },
     });
+  });
+});
+
+describe("extensionSaveContextHidden", () => {
+  const hidden = new Set(["vault", "vault-child"]);
+
+  it("reports a selected protected folder as hidden", () => {
+    expect(
+      extensionSaveContextHidden({ libraryId: "lib-a", selectedFolderId: "vault" }, hidden),
+    ).toBe(true);
+  });
+
+  it("treats an unselected / missing context as not hidden", () => {
+    expect(extensionSaveContextHidden(null, hidden)).toBe(false);
+    expect(extensionSaveContextHidden(undefined, hidden)).toBe(false);
+    expect(extensionSaveContextHidden({ libraryId: "lib-a" }, hidden)).toBe(false);
+    expect(
+      extensionSaveContextHidden({ libraryId: "lib-a", selectedFolderId: "" }, hidden),
+    ).toBe(false);
+  });
+
+  it("treats a visible selection as not hidden", () => {
+    expect(
+      extensionSaveContextHidden({ libraryId: "lib-a", selectedFolderId: "keep" }, hidden),
+    ).toBe(false);
   });
 });

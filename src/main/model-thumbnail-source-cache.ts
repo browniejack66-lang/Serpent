@@ -29,6 +29,12 @@ export function resolveModelThumbnailSourceAuthorization(input: {
   return entries.get(cacheKey(input));
 }
 
+export function clearLibraryModelThumbnailSourceAuthorizations(libraryId: string): void {
+  for (const [key, value] of entries) {
+    if (value.libraryId === libraryId) entries.delete(key);
+  }
+}
+
 export function clearModelThumbnailSourceAuthorizations(
   authorizations: readonly ModelThumbnailSourceAuthorization[],
 ): void {

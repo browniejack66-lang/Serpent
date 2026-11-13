@@ -13,6 +13,8 @@ export type ExtensionFolderOption = {
   readonly name: string;
   readonly relativePath: string;
   readonly assetCount?: number;
+  /** Serpent #91 / PR 92: desktop-supplied privacy flag, defence in depth. */
+  readonly privacy?: { readonly protected: boolean; readonly locked: boolean } | null;
 };
 
 export type SaveMenuFolderHints = {

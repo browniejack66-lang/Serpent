@@ -53,3 +53,18 @@ export function resolveExtensionSaveContext(input: {
 }): ExtensionSaveContext | null {
   return resolveExtensionSaveRouting(input).context;
 }
+
+/**
+ * Serpent #91 / PR 92: true when the desktop-selected save target belongs to
+ * a protected scope (root or any descendant). Callers MUST reject the save and
+ * ask for a new target — never silently fall back to the library root.
+ */
+export function extensionSaveContextHidden(
+  context: ExtensionSaveContext | null | undefined,
+  hiddenFolderIds: ReadonlySet<string>,
+): boolean {
+  if (!context) return false;
+  const selectedFolderId = context.selectedFolderId;
+  if (typeof selectedFolderId !== 'string' || selectedFolderId.length === 0) return false;
+  return hiddenFolderIds.has(selectedFolderId);
+}

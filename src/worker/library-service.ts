@@ -143,6 +143,30 @@ import {
   queryPluginDerivedFields as queryPluginDerivedFieldRows,
 } from './plugin-derived-field-repository';
 import {
+  FOLDER_PRIVACY_TABLE_SQL,
+  FOLDER_PRIVACY_SCHEMA_CHECKSUM,
+  FolderPrivacyStateStore,
+  collectLockedRoots,
+  privacyHiddenAssetsSql,
+  isAssetHiddenByPrivacy,
+  isLinkedRootHiddenByManagedPrivacy,
+  isLinkedScopeHiddenByPrivacy,
+  folderPrivacyBadgeForScope,
+  folderPrivacyTableExists,
+  readProtectedRoots,
+  relativePathCovers,
+  resolveScopeForFolderId,
+  folderPrivacyCrypto,
+  type ProtectedRootRow,
+  type ResolvedScope,
+} from './folder-privacy';
+import type {
+  FolderPrivacyBadge,
+  FolderPrivacyInput,
+  FolderPrivacyResult,
+  FolderPrivacyState,
+} from '../shared/folder-privacy';
+import {
   LibraryWriteCoordinator,
   LibraryWriteCoordinatorError,
   isSQLiteWriteContention,
@@ -3092,6 +3116,11 @@ function ensureFolderCustomCoverAssetSchema(connection: DatabaseConnection): voi
   }
 }
 
+function ensureFolderPrivacySchema(connection: DatabaseConnection): void {
+  // Additive, idempotent: plain CREATE TABLE IF NOT EXISTS. No table rebuild.
+  connection.exec(FOLDER_PRIVACY_TABLE_SQL);
+}
+
 function ensureAssetNormalizedExtensionSchema(connection: DatabaseConnection): void {
   const columns = columnsFor(connection, 'assets');
   if (!columns.has('normalized_extension')) {
@@ -3835,6 +3864,11 @@ export const MIGRATIONS = [
     version: 60,
     sql: LINKED_DIRECTORY_INDEX_SQL,
     checksum: createHash('sha256').update(LINKED_DIRECTORY_INDEX_SQL).digest('hex'),
+  },
+  {
+    version: 61,
+    sql: FOLDER_PRIVACY_TABLE_SQL,
+    checksum: FOLDER_PRIVACY_SCHEMA_CHECKSUM,
   },
 ] as const;
 export const SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version;
@@ -6810,6 +6844,8 @@ function migrateDatabaseUnserialized(connection: DatabaseConnection, allowFresh:
           ensureEntityAppearanceSchema(connection);
         } else if (migration.version === 58) {
           ensureFolderCustomCoverAssetSchema(connection);
+        } else if (migration.version === 61) {
+          ensureFolderPrivacySchema(connection);
         } else {
           connection.exec(migration.sql);
         }
@@ -7033,6 +7069,12 @@ export class LibraryService {
   >();
   /** Eagle imports keep their media previews but never enter auto-AI later. */
   private readonly autoAnalysisSuppressedAssetIds = new Map<string, Set<string>>();
+  /**
+   * Folder-privacy unlock state. Memory-only, per open library. A protected
+   * root is LOCKED unless unlocked here; relockLibrary on close makes a reopen
+   * start fully locked (see closeLibrary).
+   */
+  private readonly folderPrivacyState = new FolderPrivacyStateStore();
   /** Serpent-140fe2 review fix: coalesce overlapping lazy contact-sheet generations. */
   private readonly videoContactSheetInFlight = new Map<string, {
     controller: AbortController;
@@ -13884,6 +13926,7 @@ export class LibraryService {
   }): ManagedFolderSummary {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     this.assertLibraryWritable(openLibrary);
+    this.assertManagedFolderNotPrivacyLocked(openLibrary, input.folderId);
     let name: string;
     try {
       name = normalizeFolderName(input.newName);
@@ -14158,6 +14201,13 @@ export class LibraryService {
       new Set(input.folderIds).size !== input.folderIds.length
     ) {
       throw new LibraryServiceError('INVALID_SELECTION');
+    }
+    // Never move a locked folder, nor move anything INTO a locked folder.
+    for (const folderId of input.folderIds) {
+      this.assertManagedFolderNotPrivacyLocked(openLibrary, folderId);
+    }
+    if (input.targetParentFolderId !== null) {
+      this.assertManagedFolderNotPrivacyLocked(openLibrary, input.targetParentFolderId);
     }
     const strategy = input.conflictStrategy ?? 'keep-both';
     const targetParent =
@@ -14486,6 +14536,7 @@ export class LibraryService {
   } {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     this.assertLibraryWritable(openLibrary);
+    this.assertManagedFolderNotPrivacyLocked(openLibrary, input.folderId);
     const existingTombstones = openLibrary.connection.prepare(
       `SELECT tombstone_id, relative_path FROM trashed_managed_folders
         WHERE folder_id = ? ORDER BY length(relative_path) ASC`,
@@ -14763,6 +14814,7 @@ export class LibraryService {
   }): { deletedAssetCount: number; removedFolderCount: number } {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     this.assertLibraryWritable(openLibrary);
+    this.assertManagedFolderNotPrivacyLocked(openLibrary, input.folderId);
     const { folder, descendantFolders, assetIds } =
       this.collectManagedFolderSubtree(openLibrary, input.folderId);
 
@@ -14795,6 +14847,7 @@ export class LibraryService {
   }): Promise<{ deletedAssetCount: number; removedFolderCount: number }> {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     this.assertLibraryWritable(openLibrary);
+    this.assertManagedFolderNotPrivacyLocked(openLibrary, input.folderId);
     const { folder, descendantFolders, assetIds } =
       this.collectManagedFolderSubtree(openLibrary, input.folderId);
     await this.cancelMediaJobsForAssets(openLibrary, assetIds);
@@ -14828,6 +14881,9 @@ export class LibraryService {
     this.assertLibraryWritable(openLibrary);
     const folderIds = [...new Set(input.folderIds)];
     if (folderIds.length === 0) throw new LibraryServiceError('FOLDER_NOT_FOUND');
+    for (const folderId of folderIds) {
+      this.assertFolderScopeNotPrivacyLocked(input.libraryId, folderId);
+    }
 
     const rows = sqliteAllInChunks<string, { folder_id: string; relative_path: string }>({
       connection: openLibrary.connection,
@@ -15059,6 +15115,10 @@ export class LibraryService {
         }
       | undefined;
     if (!linked) throw new LibraryServiceError('FOLDER_NOT_FOUND');
+    this.assertFolderScopeNotPrivacyLocked(
+      input.libraryId,
+      isLinkedRoot ? input.linkedFolderId : encodeLinkedVirtualFolderId(input.linkedFolderId, relativePath),
+    );
 
     const prefix = isLinkedRoot ? '' : `${relativePath}/`;
     const assetQuery = isLinkedRoot
@@ -15438,6 +15498,24 @@ export class LibraryService {
             ignored_at: string;
           }>
         : [];
+      // Privacy scope ids for linked virtual directories ENCODE the relative
+      // path. Renaming the directory without rewriting those rows would orphan
+      // the protection (it would silently disappear after a restart).
+      const privacyRows = readProtectedRoots(openLibrary.connection, input.libraryId)
+        .filter((row) => row.scope_kind === 'linked'
+          && (row.linked_root_id ?? row.scope_id) === target.linkedFolderId
+          && (row.scope_relative_path === target.relativePath
+            || row.scope_relative_path.startsWith(`${target.relativePath}/`)))
+        .map((row) => {
+          const rewritten = row.scope_relative_path === target.relativePath
+            ? newRelativePath
+            : newRelativePath + row.scope_relative_path.slice(target.relativePath.length);
+          return {
+            oldScopeId: row.scope_id,
+            newScopeId: encodeLinkedVirtualFolderId(target.linkedFolderId, rewritten),
+            newRelativePath: rewritten,
+          };
+        });
       openLibrary.connection.transaction(() => {
         const updateAsset = openLibrary.connection.prepare(
           `UPDATE assets
@@ -15470,9 +15548,31 @@ export class LibraryService {
             insert.run(ignored.location_kind, ignored.linked_folder_id, rewritten, ignored.path_kind, ignored.ignored_at);
           }
         }
+        if (privacyRows.length > 0) {
+          const updatePrivacy = openLibrary.connection.prepare(
+            `UPDATE folder_privacy
+                SET scope_id = ?, scope_relative_path = ?, updated_at = ?
+              WHERE library_id = ? AND scope_kind = 'linked' AND scope_id = ?`,
+          );
+          for (const privacy of privacyRows) {
+            updatePrivacy.run(
+              privacy.newScopeId,
+              privacy.newRelativePath,
+              now,
+              input.libraryId,
+              privacy.oldScopeId,
+            );
+          }
+        }
         this.linkedDirectoryIndex(openLibrary).rename(target.linkedFolderId, target.relativePath, newRelativePath);
         this.linkedDirectoryIndex(openLibrary).add(target.linkedFolderId, newRelativePath);
       })();
+      // Re-key the in-memory unlock state: old scope ids no longer exist and
+      // renamed scopes must be locked until explicitly unlocked again.
+      for (const privacy of privacyRows) {
+        this.folderPrivacyState.relock(input.libraryId, 'linked', privacy.oldScopeId);
+        this.folderPrivacyState.relock(input.libraryId, 'linked', privacy.newScopeId);
+      }
       this.noteClientFilesystemMutation();
       if (linkedAssets.length > 0) this.emitClientAssetsChanged(input.libraryId, linkedAssets.length, true);
       return this.linkedDirectoryMutationSummary({
@@ -15984,14 +16084,560 @@ export class LibraryService {
   }
 
 
+  /**
+   * Folder privacy command. One row per protected ROOT; state list always
+   * covers ALL configured roots for the library. Lock state is memory-only.
+   */
+  folderPrivacy(input: FolderPrivacyInput): FolderPrivacyResult {
+    const openLibrary = this.requireOpenLibrary(input.libraryId);
+    const connection = openLibrary.connection;
+    const libraryId = input.libraryId;
+    const now = new Date().toISOString();
+    const protectedRows = (): ProtectedRootRow[] => readProtectedRoots(connection, libraryId);
+    const isProtected = (kind: 'managed' | 'linked', id: string): boolean =>
+      protectedRows().some((row) => row.scope_kind === kind && row.scope_id === id);
+    const ensurePrivacyTable = (): void => {
+      if (!folderPrivacyTableExists(connection)) connection.exec(FOLDER_PRIVACY_TABLE_SQL);
+    };
+
+    const requirePassword = (): string => {
+      const password = typeof input.password === 'string' ? input.password : '';
+      if (password.length === 0) {
+        throw new LibraryServiceError('FOLDER_PRIVACY_PASSWORD_REQUIRED');
+      }
+      return password;
+    };
+
+    const action = input.action;
+    // A lenient partial-migration library has no privacy table: unlock/lock/
+    // remove/change-password have nothing to act on. protect creates it.
+    if (action !== 'status' && action !== 'protect' && !folderPrivacyTableExists(connection)) {
+      throw new LibraryServiceError('FOLDER_PRIVACY_INVALID_ACTION');
+    }
+
+    if (action === 'status') {
+      // No-op; just report all roots below.
+    } else if (action === 'protect') {
+      const scope = input.folderId
+        ? resolveScopeForFolderId(connection, libraryId, input.folderId)
+        : null;
+      if (!scope) throw new LibraryServiceError('INVALID_SELECTION');
+      if (isProtected(scope.kind, scope.rootId)) {
+        throw new LibraryServiceError('FOLDER_PRIVACY_INVALID_ACTION');
+      }
+      const password = requirePassword();
+      const verifier = folderPrivacyCrypto.newVerifier(password);
+      this.assertLibraryWritable(openLibrary);
+      ensurePrivacyTable();
+      connection
+        .prepare(
+          `INSERT INTO folder_privacy
+             (library_id, scope_kind, scope_id, scope_relative_path, linked_root_id,
+              password_salt, password_hash, password_algo, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          libraryId,
+          scope.kind,
+          scope.rootId,
+          scope.relativePath,
+          scope.linkedRootId,
+          verifier.salt,
+          verifier.hash,
+          verifier.algo,
+          now,
+          now,
+        );
+      // Freshly protected => locked until explicitly unlocked.
+      this.folderPrivacyState.relock(libraryId, scope.kind, scope.rootId);
+    } else if (action === 'unlock') {
+      const scope = input.folderId
+        ? resolveScopeForFolderId(connection, libraryId, input.folderId)
+        : null;
+      if (!scope) throw new LibraryServiceError('INVALID_SELECTION');
+      const row = connection
+        .prepare(
+          'SELECT password_salt, password_hash FROM folder_privacy WHERE library_id = ? AND scope_kind = ? AND scope_id = ?',
+        )
+        .get(libraryId, scope.kind, scope.rootId) as
+        | { password_salt: string; password_hash: string }
+        | undefined;
+      if (!row) throw new LibraryServiceError('FOLDER_PRIVACY_INVALID_ACTION');
+      const password = requirePassword();
+      if (!folderPrivacyCrypto.verifyPassword(password, row.password_salt, row.password_hash)) {
+        throw new LibraryServiceError('FOLDER_PRIVACY_PASSWORD_INVALID');
+      }
+      // An inherited lock from a locked ancestor must survive unlocking this
+      // scope: otherwise unlocking a child would leak assets that the ancestor
+      // still protects. Deny the unlock while any covering root is locked.
+      const coveringRoots = collectLockedRoots(connection, libraryId, this.folderPrivacyState);
+      const inheritedLock = coveringRoots.some((root) => {
+        if (root.kind === scope.kind && root.rootId === scope.rootId) return false;
+        if (root.kind === 'managed') {
+          return scope.kind === 'managed'
+            ? relativePathCovers(root.relativePath, scope.relativePath)
+            : root.coveredLinkedRootIds.includes(scope.linkedRootId ?? '');
+        }
+        return scope.kind === 'linked'
+          && (root.linkedRootId ?? root.rootId) === scope.linkedRootId
+          && relativePathCovers(root.relativePath, scope.relativePath);
+      });
+      if (inheritedLock) throw new LibraryServiceError('FOLDER_LOCKED');
+      this.folderPrivacyState.unlock(libraryId, scope.kind, scope.rootId);
+    } else if (action === 'lock') {
+      const scope = input.folderId
+        ? resolveScopeForFolderId(connection, libraryId, input.folderId)
+        : null;
+      if (!scope) throw new LibraryServiceError('INVALID_SELECTION');
+      if (!isProtected(scope.kind, scope.rootId)) {
+        throw new LibraryServiceError('FOLDER_PRIVACY_INVALID_ACTION');
+      }
+      this.folderPrivacyState.relock(libraryId, scope.kind, scope.rootId);
+    } else if (action === 'remove') {
+      const scope = input.folderId
+        ? resolveScopeForFolderId(connection, libraryId, input.folderId)
+        : null;
+      if (!scope) throw new LibraryServiceError('INVALID_SELECTION');
+      const row = connection
+        .prepare(
+          'SELECT password_salt, password_hash FROM folder_privacy WHERE library_id = ? AND scope_kind = ? AND scope_id = ?',
+        )
+        .get(libraryId, scope.kind, scope.rootId) as
+        | { password_salt: string; password_hash: string }
+        | undefined;
+      if (!row) throw new LibraryServiceError('FOLDER_PRIVACY_INVALID_ACTION');
+      // Password confirmation required even if currently unlocked.
+      const password = requirePassword();
+      if (!folderPrivacyCrypto.verifyPassword(password, row.password_salt, row.password_hash)) {
+        throw new LibraryServiceError('FOLDER_PRIVACY_PASSWORD_INVALID');
+      }
+      this.assertLibraryWritable(openLibrary);
+      connection
+        .prepare(
+          'DELETE FROM folder_privacy WHERE library_id = ? AND scope_kind = ? AND scope_id = ?',
+        )
+        .run(libraryId, scope.kind, scope.rootId);
+      this.folderPrivacyState.relock(libraryId, scope.kind, scope.rootId);
+    } else if (action === 'change-password') {
+      const scope = input.folderId
+        ? resolveScopeForFolderId(connection, libraryId, input.folderId)
+        : null;
+      if (!scope) throw new LibraryServiceError('INVALID_SELECTION');
+      const row = connection
+        .prepare(
+          'SELECT password_salt, password_hash FROM folder_privacy WHERE library_id = ? AND scope_kind = ? AND scope_id = ?',
+        )
+        .get(libraryId, scope.kind, scope.rootId) as
+        | { password_salt: string; password_hash: string }
+        | undefined;
+      if (!row) throw new LibraryServiceError('FOLDER_PRIVACY_INVALID_ACTION');
+      const password = requirePassword();
+      if (!folderPrivacyCrypto.verifyPassword(password, row.password_salt, row.password_hash)) {
+        throw new LibraryServiceError('FOLDER_PRIVACY_PASSWORD_INVALID');
+      }
+      const newPassword = typeof input.newPassword === 'string' ? input.newPassword : '';
+      if (newPassword.length === 0 || newPassword.length > 1024) {
+        throw new LibraryServiceError('FOLDER_PRIVACY_PASSWORD_REQUIRED');
+      }
+      const verifier = folderPrivacyCrypto.newVerifier(newPassword);
+      this.assertLibraryWritable(openLibrary);
+      connection
+        .prepare(
+          `UPDATE folder_privacy
+              SET password_salt = ?, password_hash = ?, password_algo = ?, updated_at = ?
+            WHERE library_id = ? AND scope_kind = ? AND scope_id = ?`,
+        )
+        .run(
+          verifier.salt,
+          verifier.hash,
+          verifier.algo,
+          now,
+          libraryId,
+          scope.kind,
+          scope.rootId,
+        );
+      // Changing the password re-locks until the user unlocks again.
+      this.folderPrivacyState.relock(libraryId, scope.kind, scope.rootId);
+    } else {
+      throw new LibraryServiceError('FOLDER_PRIVACY_INVALID_ACTION');
+    }
+
+    // Collection asset counts are cached on the open library keyed only by
+    // the browse sequence. A lock/unlock changes visible membership without
+    // bumping that sequence, so drop the cache on every privacy action.
+    openLibrary.collectionCountCache = undefined;
+    const states = this.folderPrivacyStates(libraryId, connection);
+    return { states };
+  }
+
+  /**
+   * All configured protected ROOT states for a library. Order is deterministic
+   * (scope_kind, scope_id) so tests and UI badges are stable.
+   */
+  folderPrivacyStates(
+    libraryId: string,
+    connection = this.requireOpenLibrary(libraryId).connection,
+  ): FolderPrivacyState[] {
+    const rows = readProtectedRoots(connection, libraryId)
+      .slice()
+      .sort((a, b) => a.scope_kind.localeCompare(b.scope_kind) || a.scope_id.localeCompare(b.scope_id));
+    return rows.map((row) => ({
+      folderId: row.scope_id,
+      locked: !this.folderPrivacyState.isUnlocked(libraryId, row.scope_kind, row.scope_id),
+    }));
+  }
+
+  /** SQL predicate hiding every asset under a currently-locked root. */
+  folderPrivacyHiddenSql(
+    libraryId: string,
+    connection = this.requireOpenLibrary(libraryId).connection,
+  ): { sql: string; params: unknown[] } {
+    return privacyHiddenAssetsSql(connection, libraryId, this.folderPrivacyState);
+  }
+
+  /** Whether a specific asset path is inside a locked root (write guards). */
+  isAssetLockedByPrivacy(input: {
+    libraryId: string;
+    locationKind: 'managed' | 'linked';
+    managedFolderRelativePath: string | null;
+    linkedFolderId: string | null;
+    relativeFilePath: string;
+  }): boolean {
+    const connection = this.requireOpenLibrary(input.libraryId).connection;
+    const lockedRoots = collectLockedRoots(connection, input.libraryId, this.folderPrivacyState);
+    if (lockedRoots.length === 0) return false;
+    return isAssetHiddenByPrivacy({
+      lockedRoots,
+      locationKind: input.locationKind,
+      managedFolderRelativePath: input.managedFolderRelativePath,
+      linkedFolderId: input.linkedFolderId,
+      relativeFilePath: input.relativeFilePath,
+    });
+  }
+
+  /**
+   * True when a folder row is a DESCENDANT of a currently-locked root (the
+   * locked root itself is NOT hidden). Folders are catalog metadata; hiding
+   * descendants prevents leaking the existence/names of protected children.
+   */
+  private isPrivateFolderHiddenByPrivacy(
+    openLibrary: OpenLibrary,
+    kind: 'managed' | 'linked',
+    folderId: string,
+    relativePath: string,
+  ): boolean {
+    const libraryId = openLibrary.summary.libraryId;
+    const roots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState).filter(
+      (root) => root.kind === kind,
+    );
+    return roots.some(
+      (root) =>
+        !(kind === 'managed' && root.rootId === folderId) &&
+        relativePathCovers(root.relativePath, relativePath),
+    );
+  }
+
+  /**
+   * True when a managed folder scope (identified by stable folder_id + its
+   * current relative_path) is strictly inside a currently-locked root, or is
+   * itself a locked root. Used by write guards and browse-denial paths.
+   */
+  private isManagedScopeLocked(
+    libraryId: string,
+    openLibrary: OpenLibrary,
+    folderId: string,
+    relativePath: string,
+  ): boolean {
+    const roots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState)
+      .filter((root) => root.kind === 'managed');
+    return roots.some((root) => relativePathCovers(root.relativePath, relativePath));
+  }
+
+  /**
+   * True when a linked scope (root folder id + relative sub-path) is inside a
+   * currently-locked linked root.
+   */
+  private isLinkedScopeLocked(
+    libraryId: string,
+    openLibrary: OpenLibrary,
+    linkedFolderId: string,
+    relativePath: string,
+  ): boolean {
+    const roots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState);
+    return isLinkedScopeHiddenByPrivacy(roots, linkedFolderId, relativePath);
+  }
+
+  /**
+   * Common folder-scope fence. Commands that name a folder id but NO asset ids
+   * (custom-cover resolution, folder path resolution, hard-delete of an empty
+   * managed folder or a linked subtree) bypass the reflective asset-id fence
+   * in src/worker/index.ts, so they must be checked here. Unlocked scopes are
+   * allowed; extension imports use the stricter always-deny guard instead.
+   */
+  assertFolderScopeNotPrivacyLocked(libraryId: string, folderId: string): void {
+    const openLibrary = this.requireOpenLibrary(libraryId);
+    const scope = resolveScopeForFolderId(openLibrary.connection, libraryId, folderId);
+    if (!scope) return;
+    if (scope.kind === 'managed') {
+      if (this.isManagedScopeLocked(libraryId, openLibrary, scope.rootId, scope.relativePath)) {
+        throw new LibraryServiceError('FOLDER_LOCKED');
+      }
+      return;
+    }
+    const roots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState);
+    if (isLinkedScopeHiddenByPrivacy(roots, scope.linkedRootId ?? scope.rootId, scope.relativePath)) {
+      throw new LibraryServiceError('FOLDER_LOCKED');
+    }
+  }
+
+  /** Whole-library export must not produce a partial backup of locked files. */
+  private assertLibraryExportAllowed(libraryId: string): void {
+    const openLibrary = this.requireOpenLibrary(libraryId);
+    if (collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState).length > 0) {
+      throw new LibraryServiceError('FOLDER_LOCKED');
+    }
+  }
+
+  private folderPrivacyBadge(
+    openLibrary: OpenLibrary,
+    scope: ResolvedScope,
+  ): FolderPrivacyBadge | undefined {
+    const libraryId = openLibrary.summary.libraryId;
+    const rows = readProtectedRoots(openLibrary.connection, libraryId);
+    if (rows.length === 0) return undefined;
+    const roots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState);
+    return folderPrivacyBadgeForScope(rows, libraryId, this.folderPrivacyState, scope, roots);
+  }
+
+  /** True when a scope is currently locked, including inherited locks. */
+  private folderPrivacyScopeLocked(openLibrary: OpenLibrary, scope: ResolvedScope): boolean {
+    const libraryId = openLibrary.summary.libraryId;
+    const roots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState);
+    if (scope.kind === 'managed') {
+      return roots.some(
+        (root) => root.kind === 'managed' && relativePathCovers(root.relativePath, scope.relativePath),
+      );
+    }
+    return isLinkedScopeHiddenByPrivacy(roots, scope.linkedRootId ?? scope.rootId, scope.relativePath);
+  }
+
+  /**
+   * Worker-dispatch privacy fence. Every command naming explicit asset ids
+   * passes through this BEFORE any handler runs, so metadata, media, history,
+   * sync and export by-id reads cannot reach a locked root. No-op when the
+   * library is not open or no root is currently locked.
+   */
+  assertRequestAssetsNotPrivacyLocked(libraryId: string, assetIds: readonly string[]): void {
+    if (assetIds.length === 0 || !this.openById.has(libraryId)) return;
+    this.assertAssetsNotPrivacyLocked(this.requireOpenLibrary(libraryId), assetIds);
+  }
+
+  /**
+   * Ordered id lists (browse sessions and cached browse indexes) are built
+   * before a lock is taken. Re-apply the privacy predicate here so BOTH the
+   * page rows AND the reported total drop locked assets. Uses the same
+   * isAssetHiddenByPrivacy predicate as folderPrivacyHiddenSql, so session
+   * mode and ordinary browse can never disagree about visibility.
+   */
+  private filterAssetIdsHiddenByPrivacy(
+    openLibrary: OpenLibrary,
+    assetIds: readonly string[],
+  ): string[] {
+    if (assetIds.length === 0) return [];
+    const lockedRoots = collectLockedRoots(
+      openLibrary.connection,
+      openLibrary.summary.libraryId,
+      this.folderPrivacyState,
+    );
+    if (lockedRoots.length === 0) return [...assetIds];
+    const rows = sqliteAllInChunks<string, {
+      asset_id: string;
+      relative_file_path: string;
+      location_kind: 'managed' | 'linked';
+      linked_folder_id: string | null;
+      managed_relative_path: string | null;
+    }>({
+      connection: openLibrary.connection,
+      values: [...assetIds],
+      buildSql: (placeholders) =>
+        `SELECT a.asset_id, a.relative_file_path, a.location_kind, a.linked_folder_id,
+                mf.relative_path AS managed_relative_path
+           FROM assets a
+           LEFT JOIN managed_folders mf ON mf.folder_id = a.managed_folder_id
+          WHERE a.asset_id IN (${placeholders})`,
+    });
+    const hidden = new Set<string>();
+    for (const row of rows) {
+      if (isAssetHiddenByPrivacy({
+        lockedRoots,
+        locationKind: row.location_kind,
+        managedFolderRelativePath: row.managed_relative_path,
+        linkedFolderId: row.linked_folder_id,
+        relativeFilePath: row.relative_file_path,
+      })) hidden.add(row.asset_id);
+    }
+    return assetIds.filter((assetId) => !hidden.has(assetId));
+  }
+
+  /**
+   * Throw FOLDER_LOCKED if any of the given assets lives inside a currently
+   * locked privacy root. Central write guard shared by move/trash/history/
+   * export paths so no mutation can touch protected content.
+   */
+  private assertAssetsNotPrivacyLocked(
+    openLibrary: OpenLibrary,
+    assetIds: readonly string[],
+  ): void {
+    const libraryId = openLibrary.summary.libraryId;
+    if (assetIds.length === 0) return;
+    const lockedRoots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState);
+    if (lockedRoots.length === 0) return;
+    const rows = sqliteAllInChunks<string, {
+      relative_file_path: string;
+      location_kind: 'managed' | 'linked';
+      linked_folder_id: string | null;
+      managed_relative_path: string | null;
+    }>({
+      connection: openLibrary.connection,
+      values: [...assetIds],
+      buildSql: (placeholders) =>
+        `SELECT a.relative_file_path, a.location_kind, a.linked_folder_id,
+                mf.relative_path AS managed_relative_path
+           FROM assets a
+           LEFT JOIN managed_folders mf ON mf.folder_id = a.managed_folder_id
+          WHERE a.asset_id IN (${placeholders})`,
+    });
+    for (const row of rows) {
+      if (
+        isAssetHiddenByPrivacy({
+          lockedRoots,
+          locationKind: row.location_kind,
+          managedFolderRelativePath: row.managed_relative_path,
+          linkedFolderId: row.linked_folder_id,
+          relativeFilePath: row.relative_file_path,
+        })
+      ) {
+        throw new LibraryServiceError('FOLDER_LOCKED');
+      }
+    }
+  }
+
+  /**
+   * Throw FOLDER_LOCKED if a managed folder id is at/inside a locked root.
+   */
+  private assertManagedFolderNotPrivacyLocked(
+    openLibrary: OpenLibrary,
+    folderId: string,
+  ): void {
+    const row = openLibrary.connection
+      .prepare('SELECT relative_path FROM managed_folders WHERE folder_id = ?')
+      .get(folderId) as { relative_path: string } | undefined;
+    if (!row) return;
+    if (
+      this.isManagedScopeLocked(openLibrary.summary.libraryId, openLibrary, folderId, row.relative_path)
+    ) {
+      throw new LibraryServiceError('FOLDER_LOCKED');
+    }
+  }
+
+  /**
+   * Extension import TOCTOU guard. Rejects ANY protected scope — even one
+   * currently unlocked — because a folder.privacy preflight from Main cannot
+   * be trusted across the async download window. Must be called BOTH before
+   * download and again immediately before commit (the worker re-verifies).
+   * targetFolderId may be a managed id, linked root, or encoded virtual id.
+   */
+  assertExtensionImportTargetAllowed(libraryId: string, targetFolderId: string | undefined): void {
+    if (targetFolderId === undefined) return;
+    const openLibrary = this.requireOpenLibrary(libraryId);
+    const rows = readProtectedRoots(openLibrary.connection, libraryId);
+    if (rows.length === 0) return;
+    const scope = resolveScopeForFolderId(openLibrary.connection, libraryId, targetFolderId);
+    if (!scope) return;
+
+    // Resolve CURRENT managed root paths (rename/move safe) plus the mount
+    // point of a linked target. Every protected root blocks regardless of lock
+    // state: a preflight from Main cannot be trusted across the async download.
+    const managedRootPaths = new Map<string, string>();
+    for (const row of rows) {
+      if (row.scope_kind !== 'managed') continue;
+      const current = openLibrary.connection
+        .prepare('SELECT relative_path FROM managed_folders WHERE folder_id = ?')
+        .get(row.scope_id) as { relative_path: string } | undefined;
+      if (current) managedRootPaths.set(row.scope_id, current.relative_path);
+    }
+    let linkedMountPath: string | undefined;
+    if (scope.kind === 'linked' && scope.linkedRootId) {
+      try {
+        linkedMountPath = (openLibrary.connection
+          .prepare(
+            'SELECT mf.relative_path AS relative_path FROM linked_folders lf JOIN managed_folders mf ON mf.folder_id = lf.parent_folder_id WHERE lf.folder_id = ?',
+          )
+          .get(scope.linkedRootId) as { relative_path: string } | undefined)?.relative_path;
+      } catch {
+        linkedMountPath = undefined;
+      }
+    }
+
+    for (const row of rows) {
+      if (row.scope_kind === 'managed') {
+        const rootPath = managedRootPaths.get(row.scope_id);
+        if (rootPath === undefined) continue;
+        if (
+          scope.kind === 'managed' &&
+          (row.scope_id === scope.rootId || relativePathCovers(rootPath, scope.relativePath))
+        ) {
+          throw new LibraryServiceError('FOLDER_LOCKED');
+        }
+        // A linked root mounted under this protected managed subtree inherits
+        // the protection, even while the managed root is unlocked.
+        if (
+          scope.kind === 'linked' &&
+          linkedMountPath !== undefined &&
+          relativePathCovers(rootPath, linkedMountPath)
+        ) {
+          throw new LibraryServiceError('FOLDER_LOCKED');
+        }
+      } else if (scope.kind === 'linked') {
+        const rowLinkedRootId = row.linked_root_id ?? row.scope_id;
+        if (
+          rowLinkedRootId === scope.linkedRootId &&
+          relativePathCovers(row.scope_relative_path, scope.relativePath)
+        ) {
+          throw new LibraryServiceError('FOLDER_LOCKED');
+        }
+      }
+    }
+    const lockedRoots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState);
+    if (
+      scope.kind === 'linked' &&
+      isLinkedRootHiddenByManagedPrivacy(lockedRoots, scope.linkedRootId)
+    ) {
+      throw new LibraryServiceError('FOLDER_LOCKED');
+    }
+  }
+
   listManagedFolders(libraryId: string, showIgnored = false): ManagedFolderSummary[] {
     const openLibrary = this.requireOpenLibrary(libraryId);
+    // Locked roots stay visible (so the user can unlock) but every descendant
+    // of a locked root is hidden — independent of showIgnored.
+    const lockedManagedRoots = collectLockedRoots(
+      openLibrary.connection,
+      libraryId,
+      this.folderPrivacyState,
+    ).filter((root) => root.kind === 'managed');
+    const privacyHidesFolder = (row: ManagedFolderRow): boolean =>
+      lockedManagedRoots.some(
+        (root) => root.rootId !== row.folder_id && relativePathCovers(root.relativePath, row.relative_path),
+      );
     const rows = (openLibrary.connection
       .prepare(
         'SELECT folder_id, parent_folder_id, name, relative_path, path_identity, created_at, appearance_glyph_kind, appearance_glyph_value, appearance_color_id FROM managed_folders ORDER BY relative_path',
       )
-      .all() as ManagedFolderRow[]).filter((row) =>
-      showIgnored || !this.explicitFolderIgnored(openLibrary, 'managed', null, row.relative_path),
+      .all() as ManagedFolderRow[]).filter(
+      (row) =>
+        (showIgnored || !this.explicitFolderIgnored(openLibrary, 'managed', null, row.relative_path)) &&
+        !privacyHidesFolder(row),
     );
     const counts = this.managedFolderCountMaps(openLibrary, undefined, showIgnored);
     // Serpent-toh: ManagedFolderSummary.directAssetCount is the displayed
@@ -16001,7 +16647,9 @@ export class LibraryService {
       const summary = this.summarizeManagedFolderRow(openLibrary, row, counts);
       return {
         ...summary,
-        directAssetCount: recursive.get(row.folder_id) ?? summary.directAssetCount,
+        directAssetCount: summary.privacy?.locked
+          ? 0
+          : (recursive.get(row.folder_id) ?? summary.directAssetCount),
       };
     });
   }
@@ -16288,6 +16936,7 @@ export class LibraryService {
     libraryId: string;
     folderId: string;
   }): { absolutePath: string; mimeType: string } | null {
+    this.assertFolderScopeNotPrivacyLocked(input.libraryId, input.folderId);
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     const row = openLibrary.connection.prepare(
       `SELECT relative_name FROM folder_custom_covers
@@ -16558,14 +17207,42 @@ export class LibraryService {
     entries: FolderBrowseEntry[],
   ): FolderBrowseEntry[] {
     if (entries.length === 0) return entries;
+    // A locked folder must not paint a cover from a protected asset. This is
+    // the single final choke point for every browse entry builder (custom
+    // covers and sequence-frame previews both land here).
+    const lockedFolderIds = new Set<string>();
+    for (const entry of entries) {
+      const scope = resolveScopeForFolderId(
+        openLibrary.connection,
+        openLibrary.summary.libraryId,
+        entry.folderId,
+      );
+      if (scope && this.folderPrivacyScopeLocked(openLibrary, scope)) {
+        lockedFolderIds.add(entry.folderId);
+      }
+    }
+    const scrubbed = lockedFolderIds.size === 0 ? entries : entries.map((entry) =>
+      lockedFolderIds.has(entry.folderId)
+        ? {
+            ...entry,
+            coverArtifactIds: [],
+            coverAssetIds: [],
+            hasCustomCover: false,
+            customCoverToken: undefined,
+            customCoverAssetId: undefined,
+            customCoverArtifactId: undefined,
+            customCoverSourcePreview: undefined,
+            coverSourcePreviews: [],
+          }
+        : entry);
     const covers = this.loadFolderCustomCoverIndex(
       openLibrary,
-      entries.map((entry) => entry.folderId),
+      scrubbed.map((entry) => entry.folderId),
     );
-    if (covers.size === 0) return entries;
-    return entries.map((entry) => {
+    if (covers.size === 0) return scrubbed;
+    return scrubbed.map((entry) => {
       const cover = covers.get(entry.folderId);
-      if (!cover) return entry;
+      if (!cover || lockedFolderIds.has(entry.folderId)) return entry;
       const token = cover.token.length <= 64 ? cover.token : cover.token.slice(0, 64);
       if (cover.assetId) {
         return {
@@ -16989,6 +17666,13 @@ export class LibraryService {
       hasSequenceFrames,
     });
     const params: unknown[] = [];
+    // Folder privacy is INDEPENDENT of showIgnored: a locked root is never
+    // revealed even when the user opts to show ignored items.
+    const privacyFilter = this.folderPrivacyHiddenSql(input.libraryId, connection);
+    if (privacyFilter.sql !== '1 = 1') {
+      whereParts.push(privacyFilter.sql);
+      params.push(...privacyFilter.params);
+    }
     if (filterWhere.length > 0) {
       whereParts.push(filterWhere);
       params.push(...filterParams);
@@ -17088,9 +17772,12 @@ export class LibraryService {
       const linkedEntries = this.listLinkedFolderBrowseEntries(openLibrary, input, preparedPaths);
       if (linkedEntries !== null) return linkedEntries;
       const parent = openLibrary.connection
-        .prepare('SELECT folder_id FROM managed_folders WHERE folder_id = ?')
-        .get(input.parentFolderId) as { folder_id: string } | undefined;
+        .prepare('SELECT folder_id, relative_path FROM managed_folders WHERE folder_id = ?')
+        .get(input.parentFolderId) as { folder_id: string; relative_path: string } | undefined;
       if (!parent) throw new LibraryServiceError('FOLDER_NOT_FOUND');
+      if (this.isManagedScopeLocked(input.libraryId, openLibrary, parent.folder_id, parent.relative_path)) {
+        throw new LibraryServiceError('FOLDER_LOCKED');
+      }
     }
 
     const children = (
@@ -17139,23 +17826,32 @@ export class LibraryService {
 
     return this.withSequenceFolderCovers(openLibrary, visibleChildren.map((row) => {
       const directAssetCount = counts.directAssetCounts.get(row.folder_id) ?? 0;
+      const scope: ResolvedScope = {
+        kind: 'managed',
+        rootId: row.folder_id,
+        relativePath: row.relative_path,
+        linkedRootId: null,
+      };
+      const badge = this.folderPrivacyBadge(openLibrary, scope);
+      const locked = this.folderPrivacyScopeLocked(openLibrary, scope);
       return {
+        ...(badge ? { privacy: badge } : {}),
         folderId: row.folder_id,
         parentFolderId: row.parent_folder_id,
         locationKind: 'managed' as const,
         name: row.name,
         relativePath: row.relative_path,
         status: 'available' as const,
-        directAssetCount,
+        directAssetCount: locked ? 0 : directAssetCount,
         // Serpent-toh / REQ-FOLDER-003: display all descendant assets.
-        recursiveAssetCount: recursiveCounts.get(row.folder_id) ?? directAssetCount,
-        childFolderCount: counts.childFolderCounts.get(row.folder_id) ?? 0,
-        coverArtifactIds: coverMap.get(row.folder_id) ?? [],
+        recursiveAssetCount: locked ? 0 : (recursiveCounts.get(row.folder_id) ?? directAssetCount),
+        childFolderCount: locked ? 0 : (counts.childFolderCounts.get(row.folder_id) ?? 0),
+        coverArtifactIds: locked ? [] : (coverMap.get(row.folder_id) ?? []),
         // Serpent-d0nv: cover candidates as asset ids (cover scene scheduling
         // + progressive refresh on thumbnail.ready). Candidates do NOT require
         // a ready thumbnail — ungenerated assets get enqueued by the cover
         // scene; display covers stay ready-gated in coverArtifactIds.
-        coverAssetIds: coverCandidateMap.get(row.folder_id) ?? [],
+        coverAssetIds: locked ? [] : (coverCandidateMap.get(row.folder_id) ?? []),
         linkedFolderId: null,
       };
     }));
@@ -17173,6 +17869,7 @@ export class LibraryService {
   }, preparedPaths?: ReadonlyMap<string, string[]>): FolderBrowseEntry[] {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     const results: FolderBrowseEntry[] = [];
+    const lockedRoots = collectLockedRoots(openLibrary.connection, input.libraryId, this.folderPrivacyState);
 
     const managedIds = input.refs
       .filter((ref) => ref.locationKind === 'managed')
@@ -17223,20 +17920,35 @@ export class LibraryService {
         ) {
           continue;
         }
+        // Hide descendants of a locked root (the root itself stays visible so
+        // the user can still unlock it). Independent of explicit ignore.
+        if (
+          this.isPrivateFolderHiddenByPrivacy(openLibrary, 'managed', row.folder_id, row.relative_path)
+        ) {
+          continue;
+        }
         const directAssetCount = counts.directAssetCounts.get(folderId) ?? 0;
+        const scope: ResolvedScope = {
+          kind: 'managed',
+          rootId: row.folder_id,
+          relativePath: row.relative_path,
+          linkedRootId: null,
+        };
+        const badge = this.folderPrivacyBadge(openLibrary, scope);
+        const locked = this.folderPrivacyScopeLocked(openLibrary, scope);
         results.push({
+          ...(badge ? { privacy: badge } : {}),
           folderId: row.folder_id,
           parentFolderId: row.parent_folder_id,
           locationKind: 'managed' as const,
           name: row.name,
           relativePath: row.relative_path,
           status: 'available' as const,
-          directAssetCount,
-          recursiveAssetCount:
-            recursiveCounts.get(folderId) ?? directAssetCount,
-          childFolderCount: counts.childFolderCounts.get(folderId) ?? 0,
-          coverArtifactIds: coverMap.get(folderId) ?? [],
-          coverAssetIds: coverCandidateMap.get(folderId) ?? [],
+          directAssetCount: locked ? 0 : directAssetCount,
+          recursiveAssetCount: locked ? 0 : (recursiveCounts.get(folderId) ?? directAssetCount),
+          childFolderCount: locked ? 0 : (counts.childFolderCounts.get(folderId) ?? 0),
+          coverArtifactIds: locked ? [] : (coverMap.get(folderId) ?? []),
+          coverAssetIds: locked ? [] : (coverCandidateMap.get(folderId) ?? []),
           linkedFolderId: null,
         });
       }
@@ -17248,6 +17960,15 @@ export class LibraryService {
     for (const ref of linkedRefs) {
       const resolved = this.resolveLinkedFolderScope(openLibrary, ref.folderId);
       if (!resolved) continue;
+      const scope = resolveScopeForFolderId(openLibrary.connection, input.libraryId, ref.folderId);
+      if (
+        scope &&
+        isLinkedScopeHiddenByPrivacy(lockedRoots, scope.linkedRootId ?? scope.rootId, scope.relativePath)
+      ) {
+        continue;
+      }
+      const badge = scope ? this.folderPrivacyBadge(openLibrary, scope) : undefined;
+      const scopeLocked = scope ? this.folderPrivacyScopeLocked(openLibrary, scope) : false;
       const paths = preparedPaths?.get(resolved.linkedFolderId) ?? this.listLinkedAssetRelativePaths(
         openLibrary,
         resolved.linkedFolderId,
@@ -17265,23 +17986,24 @@ export class LibraryService {
         ? this.linkedFolderDisplayName(openLibrary, resolved.linkedFolderId)
         : linkedDirectoryName(resolved.relativePath);
       results.push({
+        ...(badge ? { privacy: badge } : {}),
         folderId: ref.folderId,
         parentFolderId: null,
         locationKind: 'linked' as const,
         name,
         relativePath: resolved.relativePath,
         status: resolved.status,
-        directAssetCount,
-        recursiveAssetCount,
+        directAssetCount: scopeLocked ? 0 : directAssetCount,
+        recursiveAssetCount: scopeLocked ? 0 : recursiveAssetCount,
         childFolderCount: 0,
-        coverArtifactIds: this.linkedDirectoryCoverArtifactIds(
+        coverArtifactIds: scopeLocked ? [] : this.linkedDirectoryCoverArtifactIds(
           openLibrary,
           resolved.linkedFolderId,
           resolved.relativePath,
           false,
           pureChildDirs,
         ),
-        coverAssetIds: this.linkedDirectoryCoverCandidateAssetIds(
+        coverAssetIds: scopeLocked ? [] : this.linkedDirectoryCoverCandidateAssetIds(
           openLibrary,
           resolved.linkedFolderId,
           resolved.relativePath,
@@ -17319,6 +18041,14 @@ export class LibraryService {
     if (input.parentFolderId === null) return null;
     const resolved = this.resolveLinkedFolderScope(openLibrary, input.parentFolderId);
     if (!resolved) return null;
+    if (this.isLinkedScopeLocked(
+      openLibrary.summary.libraryId,
+      openLibrary,
+      resolved.linkedFolderId,
+      resolved.relativePath,
+    )) {
+      throw new LibraryServiceError('FOLDER_LOCKED');
+    }
 
     const paths = preparedPaths?.get(resolved.linkedFolderId) ?? this.listLinkedAssetRelativePaths(
       openLibrary,
@@ -17349,17 +18079,26 @@ export class LibraryService {
       const directChildDirs = childDirectories.get(relativePath) ?? [];
       const childFolderCount = directChildDirs.length;
       const pureChildDirs = directAssetCount === 0 && childFolderCount > 0 ? directChildDirs : [];
+      const childScope: ResolvedScope = {
+        kind: 'linked',
+        rootId: folderId,
+        relativePath,
+        linkedRootId: resolved.linkedFolderId,
+      };
+      const badge = this.folderPrivacyBadge(openLibrary, childScope);
+      const locked = this.folderPrivacyScopeLocked(openLibrary, childScope);
       return {
+        ...(badge ? { privacy: badge } : {}),
         folderId,
         parentFolderId: input.parentFolderId,
         locationKind: 'linked' as const,
         name: linkedDirectoryName(relativePath),
         relativePath,
         status: resolved.status,
-        directAssetCount,
-        recursiveAssetCount,
-        childFolderCount,
-        coverArtifactIds: this.linkedDirectoryCoverArtifactIds(
+        directAssetCount: locked ? 0 : directAssetCount,
+        recursiveAssetCount: locked ? 0 : recursiveAssetCount,
+        childFolderCount: locked ? 0 : childFolderCount,
+        coverArtifactIds: locked ? [] : this.linkedDirectoryCoverArtifactIds(
           openLibrary,
           resolved.linkedFolderId,
           relativePath,
@@ -17370,7 +18109,7 @@ export class LibraryService {
         // + progressive refresh on thumbnail.ready). Candidates do NOT require
         // a ready thumbnail — ungenerated assets get enqueued by the cover
         // scene; display covers stay ready-gated in coverArtifactIds.
-        coverAssetIds: this.linkedDirectoryCoverCandidateAssetIds(
+        coverAssetIds: locked ? [] : this.linkedDirectoryCoverCandidateAssetIds(
           openLibrary,
           resolved.linkedFolderId,
           relativePath,
@@ -18395,13 +19134,22 @@ export class LibraryService {
     },
   ): ManagedFolderSummary {
     const resolved = counts ?? this.managedFolderCountMaps(openLibrary, [row.folder_id]);
+    const scope: ResolvedScope = {
+      kind: 'managed',
+      rootId: row.folder_id,
+      relativePath: row.relative_path,
+      linkedRootId: null,
+    };
+    const badge = this.folderPrivacyBadge(openLibrary, scope);
+    const locked = this.folderPrivacyScopeLocked(openLibrary, scope);
     return {
+      ...(badge ? { privacy: badge } : {}),
       folderId: row.folder_id,
       parentFolderId: row.parent_folder_id,
       name: row.name,
       relativePath: row.relative_path,
-      directAssetCount: resolved.directAssetCounts.get(row.folder_id) ?? 0,
-      childFolderCount: resolved.childFolderCounts.get(row.folder_id) ?? 0,
+      directAssetCount: locked ? 0 : (resolved.directAssetCounts.get(row.folder_id) ?? 0),
+      childFolderCount: locked ? 0 : (resolved.childFolderCounts.get(row.folder_id) ?? 0),
       createdAt: row.created_at,
       appearance: sanitizeEntityAppearance({
         glyphKind: row.appearance_glyph_kind,
@@ -18493,11 +19241,20 @@ export class LibraryService {
           );
         const prefixes = [...new Set([...assetPrefixes, ...diskPrefixes])].sort();
         const folderIgnored = this.linkedFolderIgnored(openLibrary, row.folder_id);
+        const rootScope: ResolvedScope = {
+          kind: 'linked',
+          rootId: row.folder_id,
+          relativePath: '',
+          linkedRootId: row.folder_id,
+        };
+        const rootBadge = this.folderPrivacyBadge(openLibrary, rootScope);
+        const rootLocked = this.folderPrivacyScopeLocked(openLibrary, rootScope);
         const root: LinkedFolderSummary = {
+          ...(rootBadge ? { privacy: rootBadge } : {}),
           folderId: row.folder_id,
           displayName: row.display_name,
           status: row.status,
-          assetCount: paths.length,
+          assetCount: rootLocked ? 0 : paths.length,
           absoluteRootPath: row.absolute_root_path,
           linkedFolderId: row.folder_id,
           relativePath: '',
@@ -18514,11 +19271,20 @@ export class LibraryService {
           .filter((prefix) => !folderIgnored(prefix))
           .map((relativePath) => {
             const parentPath = parentLinkedRelativePath(relativePath);
+            const childScope: ResolvedScope = {
+              kind: 'linked',
+              rootId: encodeLinkedVirtualFolderId(row.folder_id, relativePath),
+              relativePath,
+              linkedRootId: row.folder_id,
+            };
+            const childBadge = this.folderPrivacyBadge(openLibrary, childScope);
+            const childLocked = this.folderPrivacyScopeLocked(openLibrary, childScope);
             return {
+              ...(childBadge ? { privacy: childBadge } : {}),
               folderId: encodeLinkedVirtualFolderId(row.folder_id, relativePath),
               displayName: linkedDirectoryName(relativePath),
               status: row.status,
-              assetCount: assetCounts.get(relativePath)?.recursive ?? 0,
+              assetCount: childLocked ? 0 : (assetCounts.get(relativePath)?.recursive ?? 0),
               absoluteRootPath: row.absolute_root_path,
               linkedFolderId: row.folder_id,
               relativePath,
@@ -19523,6 +20289,11 @@ export class LibraryService {
     const revisionColumns = columnsFor(connection, 'revisions');
     const artifactColumns = columnsFor(connection, 'revision_artifacts');
     const metadataColumns = columnsFor(connection, 'asset_metadata');
+    // Privacy predicate is always applied, never gated by showIgnored. By-id
+    // lookups are still filtered so re-resolution cannot leak a locked asset.
+    const privacyFilter = this.folderPrivacyHiddenSql(input.libraryId, connection);
+    const privacySql = privacyFilter.sql;
+    const privacyParams = privacyFilter.params as unknown[];
     const selectList = [
       'a.asset_id',
       'a.managed_folder_id',
@@ -19572,7 +20343,7 @@ export class LibraryService {
           AND video_meta.invalidated_at IS NULL
         WHERE ${hasTable(connection, 'linked_ignored_assets')
           ? 'NOT EXISTS (SELECT 1 FROM linked_ignored_assets ignored WHERE ignored.asset_id = a.asset_id) AND '
-          : ''}${this.explicitIgnoreSql(connection, 'a', input.showIgnored === true)} AND ${idPredicateSql}
+          : ''}${this.explicitIgnoreSql(connection, 'a', input.showIgnored === true)} AND ${idPredicateSql} AND ${privacySql}
         ORDER BY a.relative_file_path`;
     type ListAssetRow = AssetSummaryRow & {
       deleted_at: string | null;
@@ -19585,8 +20356,8 @@ export class LibraryService {
     };
     const rows = byIds
       ? withSqliteInPredicate(connection, 'a.asset_id', idList, (sql, params) =>
-        connection.prepare(listAssetSql(sql)).all(...params) as ListAssetRow[])
-      : connection.prepare(listAssetSql('1')).all() as ListAssetRow[];
+        connection.prepare(listAssetSql(sql)).all(...params, ...privacyParams) as ListAssetRow[])
+      : connection.prepare(listAssetSql('1')).all(...privacyParams) as ListAssetRow[];
 
     // Serpent-verg.2 — fill degraded defaults for whitelisted columns that
     // an older library does not have (0031 §1.1): the feature degrades
@@ -20185,17 +20956,35 @@ export class LibraryService {
       ? 'GROUP BY t.tag_id, t.name, t.created_at'
       : 'GROUP BY t.tag_id, t.name';
     const orderBy = hasCreatedAt ? 'ORDER BY t.created_at DESC, t.name' : 'ORDER BY t.name';
+    // Tag counts are exposed over the read-only automation/MCP surface. Keep
+    // the global taxonomy: tags with no visible assets still appear with a zero
+    // count, but an assignment to a locked asset is never counted. Lenient
+    // libraries without an assets table degrade to the raw assignment count.
+    const privacyFilter = this.folderPrivacyHiddenSql(openLibrary.summary.libraryId, connection);
+    const hasAssetsTable = hasTable(connection, 'assets');
+    const countVisibleAssignments = usedJoin !== '' && hasAssetsTable;
+    const assetCountExpression = countVisibleAssignments
+      ? `SUM(CASE WHEN used.asset_id IS NULL THEN 0
+                  WHEN used.asset_id IN (
+                    SELECT a.asset_id FROM assets a WHERE ${privacyFilter.sql}
+                  ) THEN 1 ELSE 0 END)`
+      : 'COUNT(used.asset_id)';
+    // Privacy placeholders appear in the SELECT expression, so they bind
+    // before the libraryId placeholder in the WHERE clause.
+    const countParams = countVisibleAssignments
+      ? [...privacyFilter.params, openLibrary.summary.libraryId]
+      : [openLibrary.summary.libraryId];
     const rows = connection
       .prepare(
         `SELECT t.tag_id, t.name,
-                COUNT(used.asset_id) AS asset_count
+                ${assetCountExpression} AS asset_count
            FROM tags t
            ${usedJoin}
           WHERE t.library_id = ?
           ${groupBy}
           ${orderBy}`,
       )
-      .all(openLibrary.summary.libraryId) as Array<{
+      .all(...countParams) as Array<{
         tag_id: string;
         name: string;
         asset_count: number;
@@ -20798,6 +21587,7 @@ export class LibraryService {
     if (openLibrary.collectionCountCache?.browseChangeSequence === browseChangeSequence) {
       return openLibrary.collectionCountCache.counts;
     }
+    const privacyFilter = this.folderPrivacyHiddenSql(openLibrary.summary.libraryId, openLibrary.connection);
     const rows = openLibrary.connection
       .prepare(
         `WITH RECURSIVE collection_tree(root_collection_id, collection_id) AS (
@@ -20816,9 +21606,14 @@ export class LibraryService {
            JOIN collection_assets ca ON ca.collection_id = tree.collection_id
            JOIN assets a ON a.asset_id = ca.asset_id
           WHERE a.deleted_at IS NULL
+            AND ${privacyFilter.sql}
           GROUP BY tree.root_collection_id`,
       )
-      .all(openLibrary.summary.libraryId, openLibrary.summary.libraryId) as Array<{
+      .all(
+        openLibrary.summary.libraryId,
+        openLibrary.summary.libraryId,
+        ...privacyFilter.params,
+      ) as Array<{
       collection_id: string;
       asset_count: number;
     }>;
@@ -21104,6 +21899,7 @@ export class LibraryService {
       collectionIds = [input.collectionId];
     }
 
+    const privacyFilter = this.folderPrivacyHiddenSql(input.libraryId, openLibrary.connection);
     const rows = sqliteAllInChunks<string, {
         asset_id: string;
         location_kind: 'managed' | 'linked';
@@ -21132,7 +21928,9 @@ export class LibraryService {
              LEFT JOIN asset_metadata m ON m.asset_id = a.asset_id
             WHERE ca.collection_id IN (${placeholders})
               AND a.deleted_at IS NULL
+              AND ${privacyFilter.sql}
             ORDER BY ca.position, a.relative_file_path`,
+        bind: (chunk) => [...chunk, ...privacyFilter.params],
       });
     rows.sort((left, right) =>
       left.collection_position - right.collection_position ||
@@ -21258,22 +22056,26 @@ export class LibraryService {
     const days = Math.max(1, Math.min(3_650, Math.floor(input.days)));
     const limit = Math.max(1, Math.min(24, Math.floor(input.limit)));
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    // Palette counts are exposed over the read-only automation/MCP surface;
+    // exclude locked assets from BOTH the total and the artifact list.
+    const privacyFilter = this.folderPrivacyHiddenSql(openLibrary.summary.libraryId, openLibrary.connection);
     const assetCount = (openLibrary.connection.prepare(
       `SELECT COUNT(*) AS count
-         FROM assets
-        WHERE deleted_at IS NULL AND created_at >= ?`,
-    ).get(cutoff) as { count: number }).count;
+         FROM assets a
+        WHERE a.deleted_at IS NULL AND a.created_at >= ? AND ${privacyFilter.sql}`,
+    ).get(cutoff, ...privacyFilter.params) as { count: number }).count;
     const rows = openLibrary.connection.prepare(
       `SELECT a.asset_id, ra.artifact_id
          FROM assets a
          JOIN revision_artifacts ra ON ra.revision_id = a.current_revision_id
         WHERE a.deleted_at IS NULL
           AND a.created_at >= ?
+          AND ${privacyFilter.sql}
           AND ra.kind = 'extracted_palette'
           AND ra.status = 'ready'
           AND ra.invalidated_at IS NULL
         ORDER BY a.asset_id ASC, ra.artifact_id ASC`,
-    ).all(cutoff) as Array<{ asset_id: string; artifact_id: string }>;
+    ).all(cutoff, ...privacyFilter.params) as Array<{ asset_id: string; artifact_id: string }>;
 
     const totals = new Map<string, { weight: number; assetIds: Set<string> }>();
     const paletteAssetIds = new Set<string>();
@@ -21374,6 +22176,9 @@ export class LibraryService {
 
   getAssetMetadata(input: { libraryId: string; assetId: string }): AssetMetadataResult {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
+    // Central source guard: internal callers and background jobs bypass the
+    // reflective Worker dispatch fence, so deny locked assets here too.
+    this.assertRequestAssetsNotPrivacyLocked(input.libraryId, [input.assetId]);
 
     const assetRow = openLibrary.connection
       .prepare('SELECT asset_id FROM assets WHERE asset_id = ?')
@@ -22075,6 +22880,7 @@ export class LibraryService {
     isVideo: boolean;
   } {
     const openLibrary = this.requireOpenLibrary(libraryId);
+    this.assertRequestAssetsNotPrivacyLocked(libraryId, [assetId]);
 
     const asset = openLibrary.connection
       .prepare(
@@ -24081,6 +24887,7 @@ export class LibraryService {
 
   resolveAssetPath(libraryId: string, assetId: string): string {
     const openLibrary = this.requireOpenLibrary(libraryId);
+    this.assertRequestAssetsNotPrivacyLocked(libraryId, [assetId]);
     const asset = openLibrary.connection
       .prepare(
         `SELECT a.asset_id, a.location_kind, a.linked_folder_id, a.managed_folder_id,
@@ -24204,6 +25011,7 @@ export class LibraryService {
       if (!directoryExists(assetsPath)) throw new LibraryServiceError('FOLDER_NOT_FOUND');
       return assetsPath;
     }
+    this.assertFolderScopeNotPrivacyLocked(libraryId, folderId);
     const managed = openLibrary.connection
       .prepare('SELECT relative_path FROM managed_folders WHERE folder_id = ?')
       .get(folderId) as { relative_path: string } | undefined;
@@ -31081,7 +31889,8 @@ export class LibraryService {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     const asset = openLibrary.connection
       .prepare(
-        `SELECT relative_file_path, current_revision_id, availability
+        `SELECT relative_file_path, current_revision_id, availability,
+                location_kind, managed_folder_id, linked_folder_id
            FROM assets
           WHERE asset_id = ? AND deleted_at IS NULL`,
       )
@@ -31089,6 +31898,9 @@ export class LibraryService {
         relative_file_path: string;
         current_revision_id: string | null;
         availability: 'available' | 'missing';
+        location_kind: 'managed' | 'linked';
+        managed_folder_id: string | null;
+        linked_folder_id: string | null;
       } | undefined;
     if (!asset) throw new LibraryServiceError('ASSET_NOT_FOUND');
     if (asset.availability === 'missing') {
@@ -31096,6 +31908,20 @@ export class LibraryService {
     }
     if (!isSupportedModelExtension(asset.relative_file_path)) {
       throw new LibraryServiceError('UNSUPPORTED_MEDIA_TYPE');
+    }
+    const managedPath = asset.managed_folder_id
+      ? (openLibrary.connection
+          .prepare('SELECT relative_path FROM managed_folders WHERE folder_id = ?')
+          .get(asset.managed_folder_id) as { relative_path: string } | undefined)?.relative_path ?? null
+      : null;
+    if (this.isAssetLockedByPrivacy({
+      libraryId: input.libraryId,
+      locationKind: asset.location_kind,
+      managedFolderRelativePath: managedPath,
+      linkedFolderId: asset.linked_folder_id,
+      relativeFilePath: asset.relative_file_path,
+    })) {
+      throw new LibraryServiceError('FOLDER_LOCKED');
     }
     return queryModelCompanionAssets(openLibrary.connection, asset.relative_file_path);
   }
@@ -31644,19 +32470,40 @@ export class LibraryService {
   ): { absolutePath: string; mimeType: string } {
     const openLibrary = this.requireOpenLibrary(libraryId);
     const asset = openLibrary.connection.prepare(
-      `SELECT relative_file_path, current_revision_id, availability, deleted_at
+      `SELECT relative_file_path, current_revision_id, availability, deleted_at,
+              location_kind, managed_folder_id, linked_folder_id
          FROM assets WHERE asset_id = ?`,
     ).get(assetId) as {
       relative_file_path: string;
       current_revision_id: string | null;
       availability: 'available' | 'missing';
       deleted_at: string | null;
+      location_kind: 'managed' | 'linked';
+      managed_folder_id: string | null;
+      linked_folder_id: string | null;
     } | undefined;
     if (!asset || asset.deleted_at || asset.availability !== 'available') {
       throw new LibraryServiceError('ASSET_NOT_FOUND');
     }
     if (asset.current_revision_id !== revisionId) {
       throw new LibraryServiceError('ASSET_NOT_FOUND');
+    }
+    // Media source authorization must never hand out a locked asset. This is
+    // the gate that stops model/document thumbnail source authorizations and
+    // companion requests for protected content.
+    const managedPath = asset.managed_folder_id
+      ? (openLibrary.connection
+          .prepare('SELECT relative_path FROM managed_folders WHERE folder_id = ?')
+          .get(asset.managed_folder_id) as { relative_path: string } | undefined)?.relative_path ?? null
+      : null;
+    if (this.isAssetLockedByPrivacy({
+      libraryId,
+      locationKind: asset.location_kind,
+      managedFolderRelativePath: managedPath,
+      linkedFolderId: asset.linked_folder_id,
+      relativeFilePath: asset.relative_file_path,
+    })) {
+      throw new LibraryServiceError('FOLDER_LOCKED');
     }
     const extension = path.extname(asset.relative_file_path).toLowerCase();
     const mimeTypes: Record<string, string> = {
@@ -35721,9 +36568,16 @@ export class LibraryService {
     const idsOnly = input.idsOnly === true;
     const idsPage = idsOnly && input.idsPage === true;
     const layoutOnly = input.layoutOnly === true;
+    // A BrowseSession (or cached browse index) is an ordered id list built
+    // before a lock may have been taken. Re-apply the privacy predicate HERE,
+    // not only in the non-session WHERE clause: otherwise sessionMode would
+    // keep serving locked assets and reporting their count after locking.
     const sessionAssetIds = input.sessionAssetIds === undefined
       ? undefined
-      : [...new Set(input.sessionAssetIds)];
+      : this.filterAssetIdsHiddenByPrivacy(
+          openLibrary,
+          [...new Set(input.sessionAssetIds)],
+        );
     const sessionMode = sessionAssetIds !== undefined;
     const defaultBrowseIndexRequest = !sessionMode && this.isDefaultBrowseIndexRequest(input);
     const browseIndexSequenceBefore = defaultBrowseIndexRequest
@@ -35737,7 +36591,10 @@ export class LibraryService {
       && browseIndexCache !== undefined
       && browseIndexCache.browseChangeSequence === browseIndexSequenceBefore
     ) {
-      cachedBrowseAssetIds = browseIndexCache.assetIds;
+      cachedBrowseAssetIds = this.filterAssetIdsHiddenByPrivacy(
+        openLibrary,
+        browseIndexCache.assetIds,
+      );
     }
     const limit = sessionMode
       ? Math.min(500, Math.max(1, input.limit ?? 100))
@@ -35937,6 +36794,13 @@ export class LibraryService {
         hasLinkedIgnoredAssets: hasIgnoreTable,
         hasSequenceFrames,
       }));
+
+      // Privacy predicate is always applied, never gated by showIgnored.
+      const privacyFilter = this.folderPrivacyHiddenSql(openLibrary.summary.libraryId, connection);
+      if (privacyFilter.sql !== '1 = 1') {
+        whereParts.push(privacyFilter.sql);
+        allParams.push(...privacyFilter.params);
+      }
 
       if (filterWhere.length > 0) {
         whereParts.push(filterWhere);
@@ -37433,6 +38297,7 @@ export class LibraryService {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
     this.assertLibraryWritable(openLibrary);
     this.assertAssetsNotExplicitlyIgnored(openLibrary, input.assetIds);
+    this.assertAssetsNotPrivacyLocked(openLibrary, input.assetIds);
     if (input.assetIds.length === 0 || new Set(input.assetIds).size !== input.assetIds.length) {
       throw new LibraryServiceError('INVALID_SELECTION');
     }
@@ -39703,6 +40568,8 @@ export class LibraryService {
     if (!input.allowExplicitlyIgnored) {
       this.assertAssetsNotExplicitlyIgnored(openLibrary, input.assetIds);
     }
+    // Locked content can never be trashed, regardless of allowExplicitlyIgnored.
+    this.assertAssetsNotPrivacyLocked(openLibrary, input.assetIds);
     if (input.assetIds.length === 0 || new Set(input.assetIds).size !== input.assetIds.length) {
       throw new LibraryServiceError('INVALID_SELECTION');
     }
@@ -41732,13 +42599,31 @@ export class LibraryService {
         trashed_from_tombstone_id: string | null;
       }>;
 
+    // Trashing moves the file and clears managed_folder_id, so a locked root
+    // cannot be matched through the live assets row. Use the ORIGINAL library-
+    // relative path recorded at trash time; fail closed when it is missing.
+    const lockedRoots = collectLockedRoots(openLibrary.connection, libraryId, this.folderPrivacyState);
+    const visibleRows = lockedRoots.length === 0
+      ? rows
+      : rows.filter((row) => {
+          const originalPath = row.trashed_from_relative_path;
+          if (!originalPath) return false;
+          return !isAssetHiddenByPrivacy({
+            lockedRoots,
+            locationKind: row.location_kind,
+            managedFolderRelativePath: row.location_kind === 'managed' ? originalPath : null,
+            linkedFolderId: row.linked_folder_id,
+            relativeFilePath: originalPath,
+          });
+        });
+
     // Expose the same thumbnail state as the trash search scope so every
     // trash listing path can render a preview for a trashed asset.
     const artifactMap = this.thumbnailArtifactMap(
       libraryId,
-      rows.map((row) => row.asset_id),
+      visibleRows.map((row) => row.asset_id),
     );
-    const summaries = rows.map((row) => {
+    const summaries = visibleRows.map((row) => {
       const artifact = artifactMap.get(row.asset_id);
       const detectedMediaType = LibraryService.detectMediaType(row.relative_file_path);
       return this.assetSummaryFromRow({
@@ -49393,6 +50278,10 @@ export class LibraryService {
       throw new LibraryServiceError('INVALID_IMPORT_SOURCE', { reason: 'PERMISSION_DENIED' });
     }
 
+    // TOCTOU: reject any protected import target BEFORE downloading. Even an
+    // unlocked protected scope is refused for extension imports.
+    this.assertExtensionImportTargetAllowed(input.libraryId, input.targetFolderId);
+
     const downloadDirectory = path.join(
       tmpdir(),
       `serpent-extension-download-${randomUUID()}`,
@@ -49616,6 +50505,8 @@ export class LibraryService {
     filename: string;
   }): Promise<{ asset: AssetSummary }> {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
+    // TOCTOU pre-guard: refuse a protected target before touching the filesystem.
+    this.assertExtensionImportTargetAllowed(input.libraryId, input.targetFolderId);
 
     let stagedAbsolute: string;
     try {
@@ -49700,6 +50591,11 @@ export class LibraryService {
     try {
       mkdirSync(sourceDirectory, { recursive: true });
       copyFileSync(stagedAbsolute, sourcePath);
+
+      // TOCTOU re-check at commit: the folder could have been protected or
+      // relocked during the async staging window. Re-verify right before the
+      // import kernel writes and rolls back if it fails.
+      this.assertExtensionImportTargetAllowed(input.libraryId, input.targetFolderId);
 
       const prepared = this.prepareOrExecuteImport({
         libraryId: input.libraryId,
@@ -50155,6 +51051,7 @@ export class LibraryService {
     durationMs: number;
   }> {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
+    this.assertLibraryExportAllowed(input.libraryId);
     const exportId = randomUUID();
 
     // The destination is owned by this operation only if it did not exist and
@@ -50401,6 +51298,10 @@ export class LibraryService {
       for (const entry of entries) {
         totalBytes += entry.byteSize;
       }
+
+      // Re-check after the awaits above: a folder.privacy lock may have landed
+      // while the export was in flight.
+      this.assertLibraryExportAllowed(input.libraryId);
 
       // Phase 3: copy
       this.emitProgress({
@@ -50780,6 +51681,7 @@ export class LibraryService {
     durationMs: number;
   }> {
     const openLibrary = this.requireOpenLibrary(input.libraryId);
+    this.assertLibraryExportAllowed(input.libraryId);
     const exportId = randomUUID();
 
     // Ensure the destination file does not exist yet (prevent accidental overwrite).
@@ -51073,6 +51975,10 @@ export class LibraryService {
       let lastEmitTime = Date.now();
       const BATCH_SIZE = 50;
       const THROTTLE_MS = 200;
+
+      // Re-check after the awaits above: a folder.privacy lock may have landed
+      // while the export was in flight.
+      this.assertLibraryExportAllowed(input.libraryId);
 
       for (const entry of entries) {
         await transferCheckpoint();
@@ -51506,6 +52412,9 @@ export class LibraryService {
   closeLibrary(libraryId: string): void {
     const openLibrary = this.openById.get(libraryId);
     if (!openLibrary) throw new LibraryServiceError('LIBRARY_NOT_OPEN');
+    // Privacy unlock is memory-only for the open lifetime: drop it here so a
+    // reopen always starts fully locked.
+    this.folderPrivacyState.relockLibrary(libraryId);
     this.cancelDeferredOpenMaintenance(libraryId);
     this.cancelOpenBackgroundReconciliation(libraryId);
 

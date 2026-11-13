@@ -40,6 +40,8 @@ export type IconName =
   | "alert-circle"
   | "link"
   | "link-off"
+  | "lock"
+  | "unlock"
   | "loader"
   | "menu"
   | "minus"
@@ -96,6 +98,18 @@ const iconPaths: Record<IconName, ReactNode> = {
     </>
   ),
   check: <path d="M20 6 9 17l-5-5" />,
+  lock: (
+    <>
+      <rect height="11" rx="2" width="16" x="4" y="10" />
+      <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+    </>
+  ),
+  unlock: (
+    <>
+      <rect height="11" rx="2" width="16" x="4" y="10" />
+      <path d="M8 10V7a4 4 0 0 1 7.5-2" />
+    </>
+  ),
   clipboard: (
     <>
       <rect x="8" y="2" width="8" height="4" rx="1" />
